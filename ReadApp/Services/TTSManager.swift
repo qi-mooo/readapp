@@ -27,6 +27,13 @@ class TTSManager: NSObject, ObservableObject {
     private var audioCache: [Int: Data] = [:]  // 索引 -> 音频数据
     private var preloadingIndices: Set<Int> = []  // 正在预载的索引
     
+    // 下一章预载
+    private var nextChapterSentences: [String] = []  // 下一章的段落
+    private var nextChapterCache: [Int: Data] = [:]  // 下一章的音频缓存
+    
+    // 章节名朗读
+    private var isReadingChapterTitle = false  // 是否正在朗读章节名
+    
     private override init() {
         super.init()
         logger.log("TTSManager 初始化", category: "TTS")
@@ -133,6 +140,8 @@ class TTSManager: NSObject, ObservableObject {
         // 清空缓存和预载状态
         audioCache.removeAll()
         preloadedIndices.removeAll()
+        nextChapterCache.removeAll()
+        nextChapterSentences.removeAll()
         
         // 分句
         sentences = splitTextIntoSentences(text)
@@ -159,7 +168,13 @@ class TTSManager: NSObject, ObservableObject {
         
         isPlaying = true
         isPaused = false
-        speakNextSentence()
+        
+        // 如果从头开始播放，先朗读章节名
+        if currentSentenceIndex == 0 {
+            speakChapterTitle()
+        } else {
+            speakNextSentence()
+        }
     }
     
     // MARK: - 上一段
@@ -242,6 +257,70 @@ class TTSManager: NSObject, ObservableObject {
             .filter { !$0.isEmpty }  // 过滤空段落
         
         return paragraphs
+    }
+    
+    // MARK: - 朗读章节名
+    private func speakChapterTitle() {
+        guard currentChapterIndex < chapters.count else {
+            speakNextSentence()
+            return
+        }
+        
+        let chapterTitle = chapters[currentChapterIndex].title
+        logger.log("开始朗读章节名: \(chapterTitle)", category: "TTS")
+        
+        isReadingChapterTitle = true
+        
+        // 检查是否选择了 TTS 引擎
+        let ttsId = UserPreferences.shared.selectedTTSId
+        if ttsId.isEmpty {
+            logger.log("未选择 TTS 引擎，跳过章节名朗读", category: "TTS")
+            isReadingChapterTitle = false
+            speakNextSentence()
+            return
+        }
+        
+        let speechRate = UserPreferences.shared.speechRate
+        
+        // 构建 TTS 音频 URL
+        guard let audioURL = APIService.shared.buildTTSAudioURL(
+            ttsId: ttsId,
+            text: chapterTitle,
+            speechRate: speechRate
+        ) else {
+            logger.log("构建章节名音频 URL 失败", category: "TTS错误")
+            isReadingChapterTitle = false
+            speakNextSentence()
+            return
+        }
+        
+        // 播放音频
+        Task {
+            do {
+                let (data, response) = try await URLSession.shared.data(from: audioURL)
+                
+                await MainActor.run {
+                    // 检查HTTP响应
+                    if let httpResponse = response as? HTTPURLResponse,
+                       httpResponse.statusCode == 200,
+                       let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
+                       contentType.contains("audio"),
+                       data.count >= 10000 {
+                        playAudioWithData(data: data)
+                    } else {
+                        logger.log("章节名音频无效，跳过", category: "TTS")
+                        isReadingChapterTitle = false
+                        speakNextSentence()
+                    }
+                }
+            } catch {
+                logger.log("章节名音频下载失败: \(error)", category: "TTS错误")
+                await MainActor.run {
+                    isReadingChapterTitle = false
+                    speakNextSentence()
+                }
+            }
+        }
     }
     
     // MARK: - 朗读下一句
@@ -363,6 +442,7 @@ class TTSManager: NSObject, ObservableObject {
         let startIndex = currentSentenceIndex + 1
         let endIndex = min(startIndex + preloadCount, sentences.count)
         
+        // 预载当前章节的段落
         for index in startIndex..<endIndex {
             // 如果已经缓存或正在预载，跳过
             if audioCache[index] != nil || preloadingIndices.contains(index) {
@@ -371,6 +451,13 @@ class TTSManager: NSObject, ObservableObject {
             
             preloadingIndices.insert(index)
             preloadAudio(at: index)
+        }
+        
+        // 如果接近章节末尾（剩余段落少于预载数量的一半），开始预载下一章
+        let remainingSentences = sentences.count - currentSentenceIndex
+        if remainingSentences <= preloadCount / 2 && currentChapterIndex < chapters.count - 1 {
+            logger.log("接近章节末尾，开始预载下一章", category: "TTS")
+            preloadNextChapter()
         }
     }
     
@@ -483,6 +570,78 @@ class TTSManager: NSObject, ObservableObject {
         }
     }
     
+    // MARK: - 预载下一章
+    private func preloadNextChapter() {
+        // 如果已经在预载下一章或已有下一章数据，跳过
+        guard nextChapterSentences.isEmpty else { return }
+        guard currentChapterIndex < chapters.count - 1 else { return }
+        
+        let nextChapterIndex = currentChapterIndex + 1
+        logger.log("开始预载下一章: \(nextChapterIndex)", category: "TTS")
+        
+        Task {
+            do {
+                let content = try await APIService.shared.fetchChapterContent(
+                    bookUrl: bookUrl,
+                    bookSourceUrl: bookSourceUrl,
+                    index: nextChapterIndex
+                )
+                
+                await MainActor.run {
+                    // 分段
+                    nextChapterSentences = splitTextIntoSentences(content)
+                    logger.log("下一章分段完成，共 \(nextChapterSentences.count) 段", category: "TTS")
+                    
+                    // 预载下一章的前几个段落
+                    let preloadCount = min(3, nextChapterSentences.count)  // 最多预载3个段落
+                    for i in 0..<preloadCount {
+                        preloadNextChapterAudio(at: i)
+                    }
+                }
+            } catch {
+                logger.log("预载下一章失败: \(error)", category: "TTS错误")
+            }
+        }
+    }
+    
+    // MARK: - 预载下一章的音频
+    private func preloadNextChapterAudio(at index: Int) {
+        guard index < nextChapterSentences.count else { return }
+        guard nextChapterCache[index] == nil else { return }
+        
+        let sentence = nextChapterSentences[index]
+        let speechRate = UserPreferences.shared.speechRate
+        let ttsId = UserPreferences.shared.selectedTTSId
+        
+        guard !ttsId.isEmpty else { return }
+        guard let encodedText = sentence.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return }
+        
+        let urlString = "\(UserPreferences.shared.serverURL)/api/\(APIService.apiVersion)/tts?accessToken=\(UserPreferences.shared.accessToken)&id=\(ttsId)&speakText=\(encodedText)&speechRate=\(speechRate)"
+        
+        guard let url = URL(string: urlString) else { return }
+        
+        logger.log("预载下一章音频 - 索引: \(index)", category: "TTS")
+        
+        Task {
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                
+                await MainActor.run {
+                    if let httpResponse = response as? HTTPURLResponse,
+                       httpResponse.statusCode == 200,
+                       let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
+                       contentType.contains("audio"),
+                       data.count >= 10000 {
+                        nextChapterCache[index] = data
+                        logger.log("✅ 下一章预载成功 - 索引: \(index), 大小: \(data.count) 字节", category: "TTS")
+                    }
+                }
+            } catch {
+                logger.log("下一章预载失败 - 索引: \(index), 错误: \(error)", category: "TTS错误")
+            }
+        }
+    }
+    
     // MARK: - 停止
     func stop() {
         audioPlayer?.stop()
@@ -495,6 +654,8 @@ class TTSManager: NSObject, ObservableObject {
         // 清理缓存
         audioCache.removeAll()
         preloadingIndices.removeAll()
+        nextChapterCache.removeAll()
+        nextChapterSentences.removeAll()
         logger.log("TTS 停止", category: "TTS")
     }
     
@@ -518,6 +679,37 @@ class TTSManager: NSObject, ObservableObject {
     private func loadAndReadChapter() {
         stop()
         
+        // 检查是否有预载的下一章数据
+        if !nextChapterSentences.isEmpty {
+            logger.log("使用已预载的下一章数据", category: "TTS")
+            
+            // 使用预载的数据
+            sentences = nextChapterSentences
+            totalSentences = sentences.count
+            currentSentenceIndex = 0
+            
+            // 将下一章的缓存移动到当前章节
+            audioCache = nextChapterCache
+            preloadedIndices = Set(nextChapterCache.keys)
+            
+            // 清空下一章缓存
+            nextChapterCache.removeAll()
+            nextChapterSentences.removeAll()
+            
+            isPlaying = true
+            isPaused = false
+            
+            if currentChapterIndex < chapters.count {
+                updateNowPlayingInfo(chapterTitle: chapters[currentChapterIndex].title)
+            }
+            
+            // 先朗读章节名
+            speakChapterTitle()
+            
+            return
+        }
+        
+        // 没有预载数据，正常加载
         Task {
             do {
                 let content = try await APIService.shared.fetchChapterContent(
@@ -530,6 +722,11 @@ class TTSManager: NSObject, ObservableObject {
                     sentences = splitTextIntoSentences(content)
                     totalSentences = sentences.count
                     currentSentenceIndex = 0
+                    
+                    // 清空当前章节的缓存
+                    audioCache.removeAll()
+                    preloadedIndices.removeAll()
+                    
                     isPlaying = true
                     isPaused = false
                     
@@ -537,10 +734,11 @@ class TTSManager: NSObject, ObservableObject {
                         updateNowPlayingInfo(chapterTitle: chapters[currentChapterIndex].title)
                     }
                     
-                    speakNextSentence()
+                    // 先朗读章节名
+                    speakChapterTitle()
                 }
             } catch {
-                print("加载章节失败: \(error)")
+                logger.log("加载章节失败: \(error)", category: "TTS错误")
             }
         }
     }
@@ -562,6 +760,14 @@ class TTSManager: NSObject, ObservableObject {
 extension TTSManager: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         logger.log("音频播放完成 - 成功: \(flag)", category: "TTS")
+        
+        // 如果正在朗读章节名，播放完后开始朗读内容
+        if isReadingChapterTitle {
+            isReadingChapterTitle = false
+            speakNextSentence()
+            return
+        }
+        
         if flag {
             // 播放下一句
             currentSentenceIndex += 1
