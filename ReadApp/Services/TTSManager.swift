@@ -549,24 +549,50 @@ class TTSManager: NSObject, ObservableObject {
     
     // MARK: - 暂停
     func pause() {
+        logger.log("收到暂停命令 - isPlaying: \(isPlaying), isPaused: \(isPaused), audioPlayer: \(audioPlayer != nil)", category: "TTS")
+        
         if isPlaying && !isPaused {
-            audioPlayer?.pause()
-            isPaused = true
-            logger.log("TTS 暂停", category: "TTS")
-            updatePlaybackRate()
+            if let player = audioPlayer {
+                player.pause()
+                isPaused = true
+                logger.log("✅ TTS 暂停", category: "TTS")
+                updatePlaybackRate()
+            } else {
+                logger.log("⚠️ audioPlayer 不存在，无法暂停", category: "TTS")
+            }
+        } else if isPaused {
+            logger.log("TTS 已经处于暂停状态", category: "TTS")
+        } else {
+            logger.log("TTS 未在播放，无法暂停", category: "TTS")
         }
     }
     
     // MARK: - 继续
     func resume() {
+        logger.log("收到恢复命令 - isPlaying: \(isPlaying), isPaused: \(isPaused), audioPlayer: \(audioPlayer != nil)", category: "TTS")
+        
         if isPlaying && isPaused {
-            audioPlayer?.play()
-            isPaused = false
-            logger.log("TTS 恢复", category: "TTS")
-            updatePlaybackRate()
+            // 检查 audioPlayer 是否存在
+            if let player = audioPlayer {
+                player.play()
+                isPaused = false
+                logger.log("✅ TTS 恢复播放", category: "TTS")
+                updatePlaybackRate()
+            } else {
+                // audioPlayer 不存在，重新播放当前句子
+                logger.log("⚠️ audioPlayer 不存在，重新播放当前句子", category: "TTS")
+                isPaused = false
+                speakNextSentence()
+            }
         } else if !isPlaying {
             // 如果已经停止，重新开始
+            logger.log("TTS 未在播放，重新开始", category: "TTS")
+            isPlaying = true
+            isPaused = false
             speakNextSentence()
+        } else {
+            // isPlaying = true 但 isPaused = false，已经在播放中
+            logger.log("TTS 已经在播放中", category: "TTS")
         }
     }
     
