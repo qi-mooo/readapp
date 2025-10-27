@@ -98,20 +98,99 @@ class TTSManager: NSObject, ObservableObject {
     
     // MARK: - 设置通知监听
     private func setupNotifications() {
+        // 监听音频中断
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(playerDidFinishPlaying),
-            name: .AVPlayerItemDidPlayToEndTime,
-            object: nil
+            selector: #selector(handleAudioInterruption),
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+        
+        // 监听路由变更（如耳机拔出）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance()
         )
     }
     
-    // MARK: - 播放完成通知
-    @objc private func playerDidFinishPlaying(notification: Notification) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.currentSentenceIndex += 1
-            self.speakNextSentence()
+    // MARK: - 处理音频中断
+    @objc private func handleAudioInterruption(notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+        
+        switch type {
+        case .began:
+            // 中断开始（如来电、闹钟等）
+            logger.log("🔔 音频中断开始", category: "TTS")
+            if isPlaying && !isPaused {
+                pause()
+                logger.log("已暂停播放", category: "TTS")
+            }
+            
+        case .ended:
+            // 中断结束
+            guard let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt else {
+                logger.log("🔔 音频中断结束（无恢复选项）", category: "TTS")
+                return
+            }
+            
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+            if options.contains(.shouldResume) {
+                // 系统建议恢复播放
+                logger.log("🔔 音频中断结束，自动恢复播放", category: "TTS")
+                
+                // 重新激活音频会话
+                do {
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    logger.log("音频会话重新激活", category: "TTS")
+                } catch {
+                    logger.log("❌ 重新激活音频会话失败: \(error)", category: "TTS错误")
+                }
+                
+                // 延迟一点恢复，确保音频会话稳定
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self = self else { return }
+                    if self.isPlaying && self.isPaused {
+                        self.resume()
+                        self.logger.log("✅ 播放已恢复", category: "TTS")
+                    }
+                }
+            } else {
+                logger.log("🔔 音频中断结束（不建议自动恢复）", category: "TTS")
+            }
+            
+        @unknown default:
+            logger.log("⚠️ 未知的音频中断类型", category: "TTS")
+        }
+    }
+    
+    // MARK: - 处理音频路由变更
+    @objc private func handleRouteChange(notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else {
+            return
+        }
+        
+        switch reason {
+        case .oldDeviceUnavailable:
+            // 音频输出设备断开（如耳机拔出）
+            logger.log("🎧 音频设备断开，暂停播放", category: "TTS")
+            if isPlaying && !isPaused {
+                pause()
+            }
+            
+        case .newDeviceAvailable:
+            // 新的音频输出设备连接
+            logger.log("🎧 新音频设备连接", category: "TTS")
+            
+        default:
+            logger.log("🎧 音频路由变更: \(reason.rawValue)", category: "TTS")
         }
     }
     
