@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import MediaPlayer
+import UIKit
 
 class TTSManager: NSObject, ObservableObject {
     static let shared = TTSManager()
@@ -26,6 +27,8 @@ class TTSManager: NSObject, ObservableObject {
     // 预载缓存
     private var audioCache: [Int: Data] = [:]  // 索引 -> 音频数据
     private var preloadingIndices: Set<Int> = []  // 正在预载的索引
+    private var preloadRetryCount: [Int: Int] = [:]  // 预载重试次数
+    private let maxPreloadRetries = 3  // 最大重试次数
     
     // 下一章预载
     private var nextChapterSentences: [String] = []  // 下一章的段落
@@ -33,6 +36,9 @@ class TTSManager: NSObject, ObservableObject {
     
     // 章节名朗读
     private var isReadingChapterTitle = false  // 是否正在朗读章节名
+    
+    // 后台保活
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     
     private override init() {
         super.init()
@@ -137,9 +143,13 @@ class TTSManager: NSObject, ObservableObject {
         self.bookTitle = bookTitle
         self.onChapterChange = onChapterChange
         
+        // 开始后台任务
+        beginBackgroundTask()
+        
         // 清空缓存和预载状态
         audioCache.removeAll()
         preloadedIndices.removeAll()
+        preloadRetryCount.removeAll()
         nextChapterCache.removeAll()
         nextChapterSentences.removeAll()
         
@@ -206,6 +216,51 @@ class TTSManager: NSObject, ObservableObject {
             if isPlaying {
                 speakNextSentence()
             }
+        }
+    }
+    
+    // MARK: - 判断是否为纯标点或空白
+    private func isPunctuationOnly(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return true
+        }
+        
+        // 定义标点符号集合
+        let punctuationSet = CharacterSet.punctuationCharacters
+            .union(.symbols)
+            .union(.whitespacesAndNewlines)
+        
+        // 检查是否所有字符都是标点、符号或空白
+        for scalar in trimmed.unicodeScalars {
+            if !punctuationSet.contains(scalar) {
+                return false
+            }
+        }
+        
+        return true
+    }
+    
+    // MARK: - 开始后台任务
+    private func beginBackgroundTask() {
+        endBackgroundTask()  // 先结束之前的任务
+        
+        backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
+            self?.logger.log("⚠️ 后台任务即将过期", category: "TTS")
+            self?.endBackgroundTask()
+        }
+        
+        if backgroundTask != .invalid {
+            logger.log("✅ 后台任务已开始: \(backgroundTask.rawValue)", category: "TTS")
+        }
+    }
+    
+    // MARK: - 结束后台任务
+    private func endBackgroundTask() {
+        if backgroundTask != .invalid {
+            logger.log("结束后台任务: \(backgroundTask.rawValue)", category: "TTS")
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
         }
     }
     
@@ -307,6 +362,9 @@ class TTSManager: NSObject, ObservableObject {
                        contentType.contains("audio"),
                        data.count >= 10000 {
                         playAudioWithData(data: data)
+                        // 在章节名开始播放时就启动预载，避免阻塞
+                        logger.log("章节名播放中，同时启动内容预载", category: "TTS")
+                        startPreloading()
                     } else {
                         logger.log("章节名音频无效，跳过", category: "TTS")
                         isReadingChapterTitle = false
@@ -332,6 +390,16 @@ class TTSManager: NSObject, ObservableObject {
             return
         }
         
+        let sentence = sentences[currentSentenceIndex]
+        
+        // 跳过纯标点或空白
+        if isPunctuationOnly(sentence) {
+            logger.log("⏭️ 跳过纯标点/空白段落 [\(currentSentenceIndex + 1)/\(totalSentences)]: \(sentence)", category: "TTS")
+            currentSentenceIndex += 1
+            speakNextSentence()
+            return
+        }
+        
         // 保存进度
         UserPreferences.shared.saveTTSProgress(bookUrl: bookUrl, chapterIndex: currentChapterIndex, sentenceIndex: currentSentenceIndex)
         
@@ -343,7 +411,6 @@ class TTSManager: NSObject, ObservableObject {
             return
         }
         
-        let sentence = sentences[currentSentenceIndex]
         let speechRate = UserPreferences.shared.speechRate
         
         logger.log("朗读句子 \(currentSentenceIndex + 1)/\(totalSentences) - 语速: \(speechRate)", category: "TTS")
@@ -411,6 +478,7 @@ class TTSManager: NSObject, ObservableObject {
                     }
                     await MainActor.run {
                         isLoading = false
+                        logger.log("⚠️ 音频无效，尝试下一段", category: "TTS")
                         currentSentenceIndex += 1
                         speakNextSentence()
                     }
@@ -424,9 +492,10 @@ class TTSManager: NSObject, ObservableObject {
                     startPreloading()
                 }
             } catch {
-                logger.log("❌ URL不可访问: \(error.localizedDescription)", category: "TTS错误")
+                logger.log("❌ 网络错误: \(error.localizedDescription)", category: "TTS错误")
                 await MainActor.run {
                     isLoading = false
+                    logger.log("⚠️ 网络错误，尝试下一段", category: "TTS")
                     currentSentenceIndex += 1
                     speakNextSentence()
                 }
@@ -466,6 +535,14 @@ class TTSManager: NSObject, ObservableObject {
         guard index < sentences.count else { return }
         
         let sentence = sentences[index]
+        
+        // 跳过纯标点
+        if isPunctuationOnly(sentence) {
+            logger.log("⏭️ 跳过预载纯标点段落 - 索引: \(index)", category: "TTS")
+            preloadedIndices.insert(index)  // 标记为已处理，避免重复检查
+            return
+        }
+        
         let speechRate = UserPreferences.shared.speechRate
         
         guard let encodedText = sentence.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return }
@@ -475,7 +552,8 @@ class TTSManager: NSObject, ObservableObject {
         
         guard let url = URL(string: urlString) else { return }
         
-        logger.log("预载索引: \(index), URL: \(url.absoluteString)", category: "TTS")
+        let retryCount = preloadRetryCount[index] ?? 0
+        logger.log("预载索引: \(index) (第\(retryCount + 1)次尝试)", category: "TTS")
         
         Task {
             do {
@@ -493,16 +571,11 @@ class TTSManager: NSObject, ObservableObject {
                            data.count >= 10000 {  // 音频数据至少应该有10KB
                             audioCache[index] = data
                             preloadedIndices.insert(index)  // 标记为已预载
+                            preloadRetryCount.removeValue(forKey: index)  // 清除重试计数
                             logger.log("✅ 预载成功 - 索引: \(index), 大小: \(data.count) 字节", category: "TTS")
                         } else {
-                            // 数据无效，记录详细信息
-                            if data.count < 10000 {
-                                if let text = String(data: data, encoding: .utf8) {
-                                    logger.log("❌ 预载失败 - 索引: \(index), 数据太小或非音频数据，内容: \(text.prefix(200))", category: "TTS错误")
-                                } else {
-                                    logger.log("❌ 预载失败 - 索引: \(index), 数据太小: \(data.count) 字节", category: "TTS错误")
-                                }
-                            }
+                            // 数据无效，尝试重试
+                            self.handlePreloadFailure(index: index, reason: "数据无效或太小")
                         }
                     }
                     preloadingIndices.remove(index)
@@ -510,9 +583,27 @@ class TTSManager: NSObject, ObservableObject {
             } catch {
                 await MainActor.run {
                     preloadingIndices.remove(index)
-                    logger.log("❌ 预载网络错误 - 索引: \(index), 错误: \(error.localizedDescription)", category: "TTS错误")
+                    self.handlePreloadFailure(index: index, reason: "网络错误: \(error.localizedDescription)")
                 }
             }
+        }
+    }
+    
+    // MARK: - 处理预载失败
+    private func handlePreloadFailure(index: Int, reason: String) {
+        let retryCount = preloadRetryCount[index] ?? 0
+        
+        if retryCount < maxPreloadRetries {
+            preloadRetryCount[index] = retryCount + 1
+            logger.log("⚠️ 预载失败 - 索引: \(index), 原因: \(reason), 将重试 (\(retryCount + 1)/\(maxPreloadRetries))", category: "TTS")
+            
+            // 延迟后重试
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.preloadAudio(at: index)
+            }
+        } else {
+            logger.log("❌ 预载失败达到最大重试次数 - 索引: \(index), 原因: \(reason)", category: "TTS错误")
+            preloadRetryCount.removeValue(forKey: index)
         }
     }
     
@@ -531,9 +622,12 @@ class TTSManager: NSObject, ObservableObject {
             if success {
                 logger.log("✅ 音频开始播放", category: "TTS")
                 isLoading = false
+                // 延长后台任务
+                beginBackgroundTask()
             } else {
-                logger.log("❌ 音频播放失败", category: "TTS错误")
+                logger.log("❌ 音频播放失败，跳过当前段落", category: "TTS错误")
                 isLoading = false
+                // 错误恢复：跳到下一段
                 currentSentenceIndex += 1
                 speakNextSentence()
             }
@@ -541,6 +635,8 @@ class TTSManager: NSObject, ObservableObject {
             logger.log("❌ 创建 AVAudioPlayer 失败: \(error.localizedDescription)", category: "TTS错误")
             logger.log("错误详情: \(error)", category: "TTS错误")
             isLoading = false
+            // 错误恢复：跳到下一段
+            logger.log("⚠️ 音频解码失败，尝试下一段", category: "TTS")
             currentSentenceIndex += 1
             speakNextSentence()
         }
@@ -680,8 +776,11 @@ class TTSManager: NSObject, ObservableObject {
         // 清理缓存
         audioCache.removeAll()
         preloadingIndices.removeAll()
+        preloadRetryCount.removeAll()
         nextChapterCache.removeAll()
         nextChapterSentences.removeAll()
+        // 结束后台任务
+        endBackgroundTask()
         logger.log("TTS 停止", category: "TTS")
     }
     
@@ -778,6 +877,7 @@ class TTSManager: NSObject, ObservableObject {
     
     deinit {
         NotificationCenter.default.removeObserver(self)
+        endBackgroundTask()
         logger.log("TTSManager 销毁", category: "TTS")
     }
 }
