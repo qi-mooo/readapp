@@ -960,16 +960,23 @@ class TTSManager: NSObject, ObservableObject {
     }
     
     // MARK: - 检查当前章节是否预载完成，并预载下一章
-    private func checkAndPreloadNextChapter() {
+    private func checkAndPreloadNextChapter(force: Bool = false) {
         // 如果已经在预载下一章，跳过
         guard nextChapterSentences.isEmpty else {
             return
         }
-        
+
         guard currentChapterIndex < chapters.count - 1 else {
             return
         }
-        
+
+        // 章节切换后强制预载下一章，避免切换时卡顿
+        if force {
+            logger.log("章节切换后立即预载下一章", category: "TTS")
+            preloadNextChapter()
+            return
+        }
+
         // 计算进度百分比
         let progress = Double(currentSentenceIndex) / Double(max(sentences.count, 1))
         
@@ -1168,14 +1175,17 @@ class TTSManager: NSObject, ObservableObject {
             isPlaying = true
             isPaused = false
             isLoading = false
-            
+
             if currentChapterIndex < chapters.count {
                 updateNowPlayingInfo(chapterTitle: chapters[currentChapterIndex].title)
             }
-            
+
+            // 章节切换后提前准备下一章，避免章节衔接等待
+            checkAndPreloadNextChapter(force: true)
+
             // 先朗读章节名
             speakChapterTitle()
-            
+
             return
         }
         
@@ -1215,11 +1225,14 @@ class TTSManager: NSObject, ObservableObject {
                     
                     isPlaying = true
                     isPaused = false
-                    
+
                     if currentChapterIndex < chapters.count {
                         updateNowPlayingInfo(chapterTitle: chapters[currentChapterIndex].title)
                     }
-                    
+
+                    // 章节切换后提前准备下一章，避免章节衔接等待
+                    checkAndPreloadNextChapter(force: true)
+
                     // 先朗读章节名
                     speakChapterTitle()
                 }
@@ -1246,26 +1259,29 @@ class TTSManager: NSObject, ObservableObject {
 // MARK: - AVAudioPlayerDelegate
 extension TTSManager: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        logger.log("音频播放完成 - 成功: \(flag)", category: "TTS")
-        
-        // 播放间隙启动保活
-        startKeepAlive()
-        
-        // 如果正在朗读章节名，播放完后开始朗读内容
-        if isReadingChapterTitle {
-            isReadingChapterTitle = false
-            speakNextSentence()
-            return
-        }
-        
-        if flag {
-            // 播放下一句
-            currentSentenceIndex += 1
-            speakNextSentence()
-        } else {
-            logger.log("音频播放失败，跳过", category: "TTS错误")
-            currentSentenceIndex += 1
-            speakNextSentence()
+        // AVAudioPlayer 的回调线程不保证在主线程，统一切换到主线程更新状态
+        DispatchQueue.main.async {
+            self.logger.log("音频播放完成 - 成功: \(flag)", category: "TTS")
+
+            // 播放间隙启动保活
+            self.startKeepAlive()
+
+            // 如果正在朗读章节名，播放完后开始朗读内容
+            if self.isReadingChapterTitle {
+                self.isReadingChapterTitle = false
+                self.speakNextSentence()
+                return
+            }
+
+            if flag {
+                // 播放下一句
+                self.currentSentenceIndex += 1
+                self.speakNextSentence()
+            } else {
+                self.logger.log("音频播放失败，跳过", category: "TTS错误")
+                self.currentSentenceIndex += 1
+                self.speakNextSentence()
+            }
         }
     }
     

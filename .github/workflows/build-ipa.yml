@@ -1,0 +1,24 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make build script executable
+        run: chmod +x build_unsigned_ipa.sh
+
+      - name: Build unsigned IPA
+        run: ./build_unsigned_ipa.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReadApp-unsigned-ipa
+          path: build/ReadApp_unsigned.ipa
