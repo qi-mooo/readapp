@@ -71,6 +71,11 @@ struct SettingsView: View {
                         Text("\(Int(preferences.lineSpacing))")
                     }
                     Slider(value: $preferences.lineSpacing, in: 4...20, step: 2)
+                    
+                    Toggle("正文净化", isOn: $preferences.useReplaceRuleSanitization)
+                    Text("启用轻阅读替换净化规则（默认开启）")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
                 
                 Section(header: Text("听书设置")) {
@@ -270,4 +275,3 @@ struct ShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {
     }
 }
-

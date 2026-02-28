@@ -157,6 +157,12 @@ class UserPreferences: ObservableObject {
         }
     }
     
+    @Published var useReplaceRuleSanitization: Bool {
+        didSet {
+            UserDefaults.standard.set(useReplaceRuleSanitization, forKey: "useReplaceRuleSanitization")
+        }
+    }
+    
     // TTS进度记录：bookUrl -> (chapterIndex, sentenceIndex)
     private var ttsProgress: [String: (Int, Int)] {
         get {
@@ -205,6 +211,12 @@ class UserPreferences: ObservableObject {
         
         let savedPreloadCount = UserDefaults.standard.integer(forKey: "ttsPreloadCount")
         self.ttsPreloadCount = savedPreloadCount == 0 ? 10 : savedPreloadCount
+        
+        if UserDefaults.standard.object(forKey: "useReplaceRuleSanitization") == nil {
+            self.useReplaceRuleSanitization = true
+        } else {
+            self.useReplaceRuleSanitization = UserDefaults.standard.bool(forKey: "useReplaceRuleSanitization")
+        }
     }
     
     func logout() {
@@ -213,4 +225,3 @@ class UserPreferences: ObservableObject {
         isLoggedIn = false
     }
 }
-

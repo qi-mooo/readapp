@@ -1,6 +1,14 @@
 import SwiftUI
 import UIKit
 
+private struct ChapterHeaderMinYPreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGFloat] = [:]
+    
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
 struct ReadingView: View {
     let book: Book
     @EnvironmentObject var apiService: APIService
@@ -18,6 +26,27 @@ struct ReadingView: View {
     @State private var showUIControls = true  // 控制UI显示/隐藏（TTS播放时的沉浸模式）
     @State private var scrollProxy: ScrollViewProxy?  // 保存ScrollViewProxy引用
     @State private var lastTTSSentenceIndex: Int?  // 上次TTS播放的段落索引
+    @State private var preloadTask: Task<Void, Never>?
+    @State private var appendTask: Task<Void, Never>?
+    @State private var continuousChapters: [ContinuousChapterContent] = []
+    @State private var continuousChapterIndices: Set<Int> = []
+    @State private var isAppendingNextChapter = false
+    @State private var continuousSessionID = UUID()
+    @State private var lastUserScrollInteractionAt = Date.distantPast
+    @State private var autoChapterSwitchDisabledUntil = Date.distantPast
+    @State private var latestChapterHeaderMinYs: [Int: CGFloat] = [:]
+    @State private var chapterSwitchDebounceTask: Task<Void, Never>?
+    @State private var pendingScrollToChapterTopIndex: Int?
+    @State private var pendingScrollToParagraph: (chapterIndex: Int, paragraphIndex: Int)?
+    @State private var shouldRestorePositionAfterTTSStop = true
+    
+    private struct ContinuousChapterContent: Identifiable {
+        let chapterIndex: Int
+        let title: String
+        let paragraphs: [String]
+        
+        var id: Int { chapterIndex }
+    }
     
     init(book: Book) {
         self.book = book
@@ -31,18 +60,19 @@ struct ReadingView: View {
             
             VStack(spacing: 0) {
                 // 内容区域
-                ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                            // 章节标题（UI隐藏时不显示）
-                            if showUIControls {
-                        if currentChapterIndex < chapters.count {
-                            Text(chapters[currentChapterIndex].title)
-                                .font(.title2)
-                                .fontWeight(.bold)
-                                .padding(.bottom, 8)
+                GeometryReader { scrollGeometry in
+                    ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            // TTS模式显示当前章节标题
+                            if showUIControls && ttsManager.isPlaying {
+                                if currentChapterIndex < chapters.count {
+                                    Text(chapters[currentChapterIndex].title)
+                                        .font(.title)
+                                        .fontWeight(.bold)
+                                        .padding(.bottom, 8)
                                 }
-                        }
+                            }
                         
                             // 正文内容
                             if !contentSentences.isEmpty && ttsManager.isPlaying {
@@ -76,15 +106,57 @@ struct ReadingView: View {
                                     }
                                 }
                             } else {
-                                // 普通阅读模式：使用与TTS相同的分句显示
-                                if !contentSentences.isEmpty {
-                                    RichTextView(
-                                        sentences: contentSentences,
-                                        fontSize: preferences.fontSize,
-                                        lineSpacing: preferences.lineSpacing,
-                                        highlightIndex: lastTTSSentenceIndex,
-                                        scrollProxy: scrollProxy
-                                    )
+                                // 普通阅读模式：连续章节流（当前章/下一章）
+                                if !continuousChapters.isEmpty {
+                                    LazyVStack(alignment: .leading, spacing: 28) {
+                                        ForEach(continuousChapters) { chapterContent in
+                                            VStack(alignment: .leading, spacing: preferences.fontSize * 0.8) {
+                                                Text(chapterContent.title)
+                                                    .font(.title2)
+                                                    .fontWeight(.bold)
+                                                    .padding(.bottom, 8)
+                                                    .id(chapterHeaderID(chapterIndex: chapterContent.chapterIndex))
+                                                    .background(
+                                                        GeometryReader { titleGeometry in
+                                                            Color.clear.preference(
+                                                                key: ChapterHeaderMinYPreferenceKey.self,
+                                                                value: [chapterContent.chapterIndex: titleGeometry.frame(in: .named("reading-scroll")).minY]
+                                                            )
+                                                        }
+                                                    )
+                                                
+                                                ForEach(Array(chapterContent.paragraphs.enumerated()), id: \.offset) { index, sentence in
+                                                    Text("　　" + sentence.trimmingCharacters(in: .whitespacesAndNewlines))
+                                                        .font(.system(size: preferences.fontSize))
+                                                        .lineSpacing(preferences.lineSpacing)
+                                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                                        .fixedSize(horizontal: false, vertical: true)
+                                                        .padding(.vertical, 6)
+                                                        .padding(.horizontal, 8)
+                                                        .background(
+                                                            RoundedRectangle(cornerRadius: 4)
+                                                                .fill(
+                                                                    chapterContent.chapterIndex == currentChapterIndex && index == lastTTSSentenceIndex
+                                                                        ? Color.orange.opacity(0.2)
+                                                                        : Color.clear
+                                                                )
+                                                                .animation(.easeInOut(duration: 0.3), value: lastTTSSentenceIndex)
+                                                        )
+                                                        .id(paragraphID(chapterIndex: chapterContent.chapterIndex, paragraphIndex: index))
+                                                }
+                                            }
+                                        }
+                                        
+                                        if isAppendingNextChapter {
+                                            HStack {
+                                                Spacer()
+                                                ProgressView("加载后续章节...")
+                                                    .font(.caption)
+                                                Spacer()
+                                            }
+                                            .padding(.vertical, 8)
+                                        }
+                                    }
                                 } else {
                                     // 如果没有句子，显示原始内容
                                     Text(currentContent)
@@ -94,6 +166,23 @@ struct ReadingView: View {
                             }
                         }
                         .padding()
+                    }
+                    .coordinateSpace(name: "reading-scroll")
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { _ in
+                                lastUserScrollInteractionAt = Date()
+                            }
+                            .onEnded { _ in
+                                lastUserScrollInteractionAt = Date()
+                                scheduleVisibleChapterEvaluation(
+                                    switchLineY: min(scrollGeometry.size.height * 0.22, 150)
+                                )
+                            }
+                    )
+                    .onPreferenceChange(ChapterHeaderMinYPreferenceKey.self) { chapterHeaderMinYs in
+                        guard !ttsManager.isPlaying else { return }
+                        latestChapterHeaderMinYs = chapterHeaderMinYs
                     }
                     .contentShape(Rectangle())  // 使整个区域可点击
                     .onTapGesture {
@@ -114,6 +203,8 @@ struct ReadingView: View {
                         // 保存proxy引用，用于后续滚动
                         scrollProxy = proxy
                     }
+                }
+                
                 }
                 
                 // 底部控制栏（UI隐藏时不显示）
@@ -159,6 +250,11 @@ struct ReadingView: View {
                 currentIndex: currentChapterIndex,
                 onSelectChapter: { index in
                     currentChapterIndex = index
+                    pendingScrollToChapterTopIndex = index
+                    pendingScrollToParagraph = nil
+                    if ttsManager.isPlaying {
+                        shouldRestorePositionAfterTTSStop = false
+                    }
                     loadChapterContent()
                     showChapterList = false
                 }
@@ -178,22 +274,18 @@ struct ReadingView: View {
         }
         .onDisappear {
             saveProgress()
+            preloadTask?.cancel()
+            appendTask?.cancel()
+            chapterSwitchDebounceTask?.cancel()
         }
         .onChange(of: ttsManager.isPlaying) { isPlaying in
             // 当TTS停止播放时，自动显示UI并更新高亮位置
             if !isPlaying {
                 showUIControls = true
-                // 更新最后播放的句子索引，以便在普通模式显示高亮
-                if ttsManager.currentSentenceIndex > 0 && ttsManager.currentSentenceIndex <= contentSentences.count {
-                    lastTTSSentenceIndex = ttsManager.currentSentenceIndex - 1
-                    // 滚动到最后播放的位置
-                    if let scrollProxy = scrollProxy, let lastIndex = lastTTSSentenceIndex {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            withAnimation {
-                                scrollProxy.scrollTo(lastIndex, anchor: .center)
-                            }
-                        }
-                    }
+                if shouldRestorePositionAfterTTSStop {
+                    restorePositionAfterTTSStop()
+                } else {
+                    shouldRestorePositionAfterTTSStop = true
                 }
             }
         }
@@ -230,6 +322,160 @@ struct ReadingView: View {
         return paragraphs
     }
     
+    private func paragraphID(chapterIndex: Int, paragraphIndex: Int) -> String {
+        "chapter-\(chapterIndex)-paragraph-\(paragraphIndex)"
+    }
+    
+    private func chapterHeaderID(chapterIndex: Int) -> String {
+        "chapter-\(chapterIndex)-header"
+    }
+    
+    private func resetContinuousReading(chapterIndex: Int, paragraphs: [String]) {
+        appendTask?.cancel()
+        continuousSessionID = UUID()
+        autoChapterSwitchDisabledUntil = Date().addingTimeInterval(0.45)
+        continuousChapters = [
+            ContinuousChapterContent(
+                chapterIndex: chapterIndex,
+                title: chapters[chapterIndex].title,
+                paragraphs: paragraphs
+            )
+        ]
+        continuousChapterIndices = [chapterIndex]
+        isAppendingNextChapter = false
+        ensureContinuousWindow(centerChapterIndex: chapterIndex)
+    }
+    
+    private func switchToVisibleChapter(_ chapterContent: ContinuousChapterContent) {
+        guard currentChapterIndex != chapterContent.chapterIndex else { return }
+        
+        currentChapterIndex = chapterContent.chapterIndex
+        currentContent = chapterContent.paragraphs.joined(separator: "\n")
+        contentSentences = chapterContent.paragraphs
+        lastTTSSentenceIndex = nil
+        autoChapterSwitchDisabledUntil = Date().addingTimeInterval(0.25)
+        
+        ensureContinuousWindow(centerChapterIndex: chapterContent.chapterIndex)
+        saveProgress()
+    }
+    
+    private func scheduleVisibleChapterEvaluation(switchLineY: CGFloat) {
+        chapterSwitchDebounceTask?.cancel()
+        chapterSwitchDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            guard !Task.isCancelled else { return }
+            guard !ttsManager.isPlaying else { return }
+            guard Date() >= autoChapterSwitchDisabledUntil else { return }
+            let elapsed = Date().timeIntervalSince(lastUserScrollInteractionAt)
+            guard elapsed > 0.12 && elapsed < 1.2 else { return }
+            updateVisibleChapterByHeaderPosition(
+                chapterHeaderMinYs: latestChapterHeaderMinYs,
+                switchLineY: switchLineY
+            )
+        }
+    }
+    
+    private func updateVisibleChapterByHeaderPosition(chapterHeaderMinYs: [Int: CGFloat], switchLineY: CGFloat) {
+        guard !chapterHeaderMinYs.isEmpty else { return }
+        guard Date() >= autoChapterSwitchDisabledUntil else { return }
+        guard let currentHeaderY = chapterHeaderMinYs[currentChapterIndex] else { return }
+        
+        let passedHeaders = chapterHeaderMinYs
+            .filter { $0.value <= switchLineY }
+            .sorted { $0.value < $1.value }
+        
+        guard let targetChapterIndex = passedHeaders.last?.key else { return }
+        
+        guard targetChapterIndex != currentChapterIndex else { return }
+        guard abs(targetChapterIndex - currentChapterIndex) <= 1 else { return }
+        
+        let switchHysteresis: CGFloat = 22
+        if targetChapterIndex > currentChapterIndex {
+            guard let targetHeaderY = chapterHeaderMinYs[targetChapterIndex],
+                  targetHeaderY <= switchLineY - switchHysteresis else { return }
+        } else {
+            guard currentHeaderY >= switchLineY + switchHysteresis else { return }
+        }
+        
+        guard let chapterContent = continuousChapters.first(where: { $0.chapterIndex == targetChapterIndex }) else {
+            return
+        }
+        
+        switchToVisibleChapter(chapterContent)
+    }
+    
+    private func ensureContinuousWindow(centerChapterIndex: Int) {
+        guard centerChapterIndex >= 0, centerChapterIndex < chapters.count else { return }
+        
+        let loadID = UUID()
+        continuousSessionID = loadID
+        
+        let targetIndices = Set(
+            [centerChapterIndex, centerChapterIndex + 1]
+                .filter { $0 >= 0 && $0 < chapters.count }
+        )
+        
+        let sessionID = loadID
+        let existingMap = Dictionary(uniqueKeysWithValues: continuousChapters.map { ($0.chapterIndex, $0) })
+        let missingIndices = targetIndices.sorted().filter { existingMap[$0] == nil }
+        
+        if missingIndices.isEmpty {
+            let limited = targetIndices.sorted().compactMap { existingMap[$0] }
+            continuousChapters = limited
+            continuousChapterIndices = Set(limited.map(\.chapterIndex))
+            preloadAdjacentChapters(around: centerChapterIndex)
+            return
+        }
+        
+        isAppendingNextChapter = true
+        appendTask?.cancel()
+        
+        appendTask = Task {
+            var mergedMap = existingMap
+            
+            do {
+                for index in missingIndices {
+                    try Task.checkCancellation()
+                    
+                    let content = try await apiService.fetchChapterContent(
+                        bookUrl: book.bookUrl ?? "",
+                        bookSourceUrl: book.origin,
+                        index: index,
+                        bookName: book.name
+                    )
+                    
+                    let cleanedContent = removeHTMLAndSVG(content)
+                    let paragraphs = splitIntoParagraphs(cleanedContent)
+                    
+                    mergedMap[index] = ContinuousChapterContent(
+                        chapterIndex: index,
+                        title: chapters[index].title,
+                        paragraphs: paragraphs
+                    )
+                }
+                
+                await MainActor.run {
+                    guard sessionID == continuousSessionID else { return }
+                    
+                    let limited = targetIndices.sorted().compactMap { mergedMap[$0] }
+                    continuousChapters = limited
+                    continuousChapterIndices = Set(limited.map(\.chapterIndex))
+                    isAppendingNextChapter = false
+                    preloadAdjacentChapters(around: centerChapterIndex)
+                }
+            } catch {
+                await MainActor.run {
+                    guard sessionID == continuousSessionID else { return }
+                    
+                    let limited = targetIndices.sorted().compactMap { mergedMap[$0] }
+                    continuousChapters = limited
+                    continuousChapterIndices = Set(limited.map(\.chapterIndex))
+                    isAppendingNextChapter = false
+                }
+            }
+        }
+    }
+    
     // MARK: - 加载章节列表
     private func loadChapters() async {
         isLoading = true
@@ -237,6 +483,11 @@ struct ReadingView: View {
             chapters = try await apiService.fetchChapterList(
                 bookUrl: book.bookUrl ?? "",
                 bookSourceUrl: book.origin
+            )
+            currentChapterIndex = resolveInitialChapterIndexByTitle(
+                preferredIndex: currentChapterIndex,
+                preferredTitle: book.durChapterTitle,
+                chapters: chapters
             )
             
             // 加载当前章节内容
@@ -251,13 +502,19 @@ struct ReadingView: View {
     private func loadChapterContent() {
         guard currentChapterIndex < chapters.count else { return }
         
+        if pendingScrollToParagraph == nil && pendingScrollToChapterTopIndex == nil {
+            pendingScrollToChapterTopIndex = currentChapterIndex
+        }
+        
+        autoChapterSwitchDisabledUntil = Date().addingTimeInterval(0.55)
         isLoading = true
         Task {
             do {
                 let content = try await apiService.fetchChapterContent(
                     bookUrl: book.bookUrl ?? "",
                     bookSourceUrl: book.origin,
-                    index: currentChapterIndex
+                    index: currentChapterIndex,
+                    bookName: book.name
                 )
                 
                 await MainActor.run {
@@ -266,22 +523,32 @@ struct ReadingView: View {
                         currentContent = "章节内容为空\n\n可能的原因：\n1. 书源暂时无法访问\n2. 该章节需要VIP权限\n3. 网络连接问题\n\n请稍后重试或更换书源"
                         errorMessage = "章节内容为空"
                         contentSentences = []
+                        continuousSessionID = UUID()
+                        continuousChapters = []
+                        continuousChapterIndices = []
                     } else {
                         // 移除所有HTML和SVG标签
                         let cleanedContent = removeHTMLAndSVG(content)
                         currentContent = cleanedContent
                         
                         // 分割句子以便TTS高亮
-                        contentSentences = splitIntoParagraphs(cleanedContent)
+                        let paragraphs = splitIntoParagraphs(cleanedContent)
+                        contentSentences = paragraphs
+                        resetContinuousReading(chapterIndex: currentChapterIndex, paragraphs: paragraphs)
                         
-                        // 检查是否有TTS进度，如果有则设置高亮并滚动到上次播放的段落
                         if let progress = preferences.getTTSProgress(bookUrl: book.bookUrl ?? ""),
                            progress.chapterIndex == currentChapterIndex,
-                           progress.sentenceIndex < contentSentences.count {
-                            // 设置高亮段落索引
+                           progress.sentenceIndex < paragraphs.count {
                             lastTTSSentenceIndex = progress.sentenceIndex
                         } else {
                             lastTTSSentenceIndex = nil
+                        }
+                        
+                        if scrollToPendingParagraphIfNeeded(paragraphs: paragraphs) {
+                            pendingScrollToChapterTopIndex = nil
+                        } else if pendingScrollToChapterTopIndex == currentChapterIndex {
+                            scrollToChapterTop(chapterIndex: currentChapterIndex)
+                            pendingScrollToChapterTopIndex = nil
                         }
                     }
                     isLoading = false
@@ -290,12 +557,13 @@ struct ReadingView: View {
                     if ttsManager.isPlaying {
                         let currentBookUrl = book.bookUrl ?? ""
                         if ttsManager.bookUrl != currentBookUrl || ttsManager.currentChapterIndex != currentChapterIndex {
+                            shouldRestorePositionAfterTTSStop = false
                             ttsManager.stop()
                         }
                     }
                     
-                    // 预加载下一章内容到缓存
-                    preloadNextChapter()
+                    // 预加载相邻章节内容到缓存
+                    preloadAdjacentChapters(around: currentChapterIndex)
                 }
             } catch {
                 await MainActor.run {
@@ -308,9 +576,79 @@ struct ReadingView: View {
                     } else {
                         currentContent = "章节加载失败\n\n错误信息: \(errorDescription)\n\n请稍后重试"
                     }
+                    continuousSessionID = UUID()
+                    continuousChapters = []
+                    continuousChapterIndices = []
+                    pendingScrollToParagraph = nil
                     isLoading = false
                 }
             }
+        }
+    }
+    
+    private func scrollToChapterTop(chapterIndex: Int) {
+        autoChapterSwitchDisabledUntil = Date().addingTimeInterval(0.7)
+        let targetID = chapterHeaderID(chapterIndex: chapterIndex)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                scrollProxy?.scrollTo(targetID, anchor: .top)
+            }
+        }
+    }
+    
+    private func scrollToParagraph(chapterIndex: Int, paragraphIndex: Int, anchor: UnitPoint = .center) {
+        autoChapterSwitchDisabledUntil = Date().addingTimeInterval(0.7)
+        let targetID = paragraphID(chapterIndex: chapterIndex, paragraphIndex: paragraphIndex)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                scrollProxy?.scrollTo(targetID, anchor: anchor)
+            }
+        }
+    }
+    
+    @discardableResult
+    private func scrollToPendingParagraphIfNeeded(paragraphs: [String]) -> Bool {
+        guard let pending = pendingScrollToParagraph, pending.chapterIndex == currentChapterIndex else {
+            return false
+        }
+        
+        guard !paragraphs.isEmpty else {
+            pendingScrollToParagraph = nil
+            return false
+        }
+        
+        let safeIndex = min(max(pending.paragraphIndex, 0), paragraphs.count - 1)
+        lastTTSSentenceIndex = safeIndex
+        scrollToParagraph(chapterIndex: currentChapterIndex, paragraphIndex: safeIndex, anchor: .center)
+        pendingScrollToParagraph = nil
+        return true
+    }
+    
+    private func restorePositionAfterTTSStop() {
+        guard let bookUrl = book.bookUrl else { return }
+        
+        chapterSwitchDebounceTask?.cancel()
+        autoChapterSwitchDisabledUntil = Date().addingTimeInterval(1.0)
+        
+        let savedProgress = preferences.getTTSProgress(bookUrl: bookUrl)
+        let targetChapterIndex = savedProgress?.chapterIndex ?? ttsManager.currentChapterIndex
+        guard targetChapterIndex >= 0, targetChapterIndex < chapters.count else { return }
+        
+        let targetSentenceIndex: Int
+        if let saved = savedProgress, saved.chapterIndex == targetChapterIndex {
+            targetSentenceIndex = max(saved.sentenceIndex, 0)
+        } else {
+            targetSentenceIndex = max(ttsManager.currentSentenceIndex - 1, 0)
+        }
+        
+        pendingScrollToChapterTopIndex = nil
+        pendingScrollToParagraph = (targetChapterIndex, targetSentenceIndex)
+        
+        if targetChapterIndex == currentChapterIndex {
+            _ = scrollToPendingParagraphIfNeeded(paragraphs: contentSentences)
+        } else {
+            currentChapterIndex = targetChapterIndex
+            loadChapterContent()
         }
     }
     
@@ -318,6 +656,11 @@ struct ReadingView: View {
     private func previousChapter() {
         guard currentChapterIndex > 0 else { return }
         currentChapterIndex -= 1
+        pendingScrollToChapterTopIndex = currentChapterIndex
+        pendingScrollToParagraph = nil
+        if ttsManager.isPlaying {
+            shouldRestorePositionAfterTTSStop = false
+        }
         loadChapterContent()
         saveProgress()
     }
@@ -326,6 +669,11 @@ struct ReadingView: View {
     private func nextChapter() {
         guard currentChapterIndex < chapters.count - 1 else { return }
         currentChapterIndex += 1
+        pendingScrollToChapterTopIndex = currentChapterIndex
+        pendingScrollToParagraph = nil
+        if ttsManager.isPlaying {
+            shouldRestorePositionAfterTTSStop = false
+        }
         loadChapterContent()
         saveProgress()
     }
@@ -363,27 +711,19 @@ struct ReadingView: View {
         }
     }
     
-    // MARK: - 预加载下一章
-    private func preloadNextChapter() {
-        // 检查是否有下一章
-        guard currentChapterIndex < chapters.count - 1 else { return }
+    // MARK: - 预加载后续章节（下一章）
+    private func preloadAdjacentChapters(around chapterIndex: Int) {
+        let indices = [chapterIndex + 1].filter { $0 >= 0 && $0 < chapters.count }
+        guard !indices.isEmpty else { return }
         
-        let nextChapterIndex = currentChapterIndex + 1
-        
-        // 在后台预加载下一章内容
-        Task {
-            do {
-                // 调用 fetchChapterContent 会自动将内容存入 APIService 的缓存
-                _ = try await apiService.fetchChapterContent(
-                    bookUrl: book.bookUrl ?? "",
-                    bookSourceUrl: book.origin,
-                    index: nextChapterIndex
-                )
-                print("✅ 已预加载下一章：\(chapters[nextChapterIndex].title)")
-            } catch {
-                // 预加载失败不影响当前阅读，静默处理
-                print("⚠️ 预加载下一章失败: \(error.localizedDescription)")
-            }
+        preloadTask?.cancel()
+        preloadTask = Task {
+            await apiService.preloadChapterContents(
+                bookUrl: book.bookUrl ?? "",
+                bookSourceUrl: book.origin,
+                indices: indices,
+                bookName: book.name
+            )
         }
     }
     
@@ -404,6 +744,48 @@ struct ReadingView: View {
                 print("保存进度失败: \(error)")
             }
         }
+    }
+    
+    private func resolveInitialChapterIndexByTitle(preferredIndex: Int, preferredTitle: String?, chapters: [BookChapter]) -> Int {
+        guard !chapters.isEmpty else { return 0 }
+        let clampedIndex = min(max(preferredIndex, 0), chapters.count - 1)
+        
+        guard let title = preferredTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else {
+            return clampedIndex
+        }
+        
+        func normalize(_ value: String) -> String {
+            value.replacingOccurrences(of: " ", with: "")
+                .replacingOccurrences(of: "　", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        let normalizedTitle = normalize(title)
+        
+        if normalize(chapters[clampedIndex].title) == normalizedTitle {
+            return clampedIndex
+        }
+        
+        if clampedIndex + 1 < chapters.count, normalize(chapters[clampedIndex + 1].title) == normalizedTitle {
+            return clampedIndex + 1
+        }
+        
+        if clampedIndex > 0, normalize(chapters[clampedIndex - 1].title) == normalizedTitle {
+            return clampedIndex - 1
+        }
+        
+        if let exact = chapters.firstIndex(where: { normalize($0.title) == normalizedTitle }) {
+            return exact
+        }
+        
+        if let fuzzy = chapters.firstIndex(where: {
+            let t = normalize($0.title)
+            return t.contains(normalizedTitle) || normalizedTitle.contains(t)
+        }) {
+            return fuzzy
+        }
+        
+        return clampedIndex
     }
 }
 
@@ -690,4 +1072,3 @@ struct NormalControlBar: View {
         .shadow(color: Color.black.opacity(0.1), radius: 5, y: -2)
     }
 }
-

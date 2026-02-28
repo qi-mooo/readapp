@@ -2,6 +2,167 @@ import Foundation
 import Combine
 import UIKit
 
+private actor ChapterContentCacheStore {
+    struct ManifestEntry: Codable {
+        let fileName: String
+        var lastAccessTime: TimeInterval
+    }
+    
+    private let maxDiskEntries = 300
+    private let expirationInterval: TimeInterval = 7 * 24 * 60 * 60
+    private let memoryCache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 120
+        return cache
+    }()
+    private let fileManager = FileManager.default
+    private let cacheDirectory: URL
+    private let manifestURL: URL
+    
+    private var manifest: [String: ManifestEntry] = [:]
+    private var isPrepared = false
+    
+    init() {
+        let fm = FileManager.default
+        let root = fm.urls(for: .cachesDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
+        self.cacheDirectory = root.appendingPathComponent("ReadAppChapterContentCache", isDirectory: true)
+        self.manifestURL = cacheDirectory.appendingPathComponent("manifest.json")
+    }
+    
+    func get(for key: String) -> String? {
+        if let memoryValue = memoryCache.object(forKey: key as NSString) {
+            return memoryValue as String
+        }
+        
+        ensurePrepared()
+        
+        guard let entry = manifest[key] else {
+            return nil
+        }
+        
+        if isExpired(entry) {
+            removeEntry(for: key, entry: entry)
+            saveManifest()
+            return nil
+        }
+        
+        let fileURL = cacheDirectory.appendingPathComponent(entry.fileName)
+        guard let data = try? Data(contentsOf: fileURL),
+              let content = String(data: data, encoding: .utf8) else {
+            manifest.removeValue(forKey: key)
+            saveManifest()
+            return nil
+        }
+        
+        memoryCache.setObject(content as NSString, forKey: key as NSString)
+        manifest[key]?.lastAccessTime = Date().timeIntervalSince1970
+        saveManifest()
+        return content
+    }
+    
+    func set(_ content: String, for key: String) {
+        ensurePrepared()
+        
+        memoryCache.setObject(content as NSString, forKey: key as NSString)
+        
+        guard let data = content.data(using: .utf8) else {
+            return
+        }
+        
+        let fileName = "\(stableHash(key)).txt"
+        let fileURL = cacheDirectory.appendingPathComponent(fileName)
+        
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            manifest[key] = ManifestEntry(fileName: fileName, lastAccessTime: Date().timeIntervalSince1970)
+            cleanupExpiredAndOverflow()
+            saveManifest()
+        } catch {
+            LogManager.shared.log("写入章节缓存失败: \(error)", category: "缓存错误")
+        }
+    }
+    
+    func removeAll() {
+        ensurePrepared()
+        
+        memoryCache.removeAllObjects()
+        manifest.removeAll()
+        
+        do {
+            if fileManager.fileExists(atPath: cacheDirectory.path) {
+                try fileManager.removeItem(at: cacheDirectory)
+            }
+            try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+            saveManifest()
+        } catch {
+            LogManager.shared.log("清理章节缓存失败: \(error)", category: "缓存错误")
+        }
+    }
+    
+    private func ensurePrepared() {
+        guard !isPrepared else {
+            return
+        }
+        
+        isPrepared = true
+        
+        do {
+            try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+            if let data = try? Data(contentsOf: manifestURL),
+               let decoded = try? JSONDecoder().decode([String: ManifestEntry].self, from: data) {
+                manifest = decoded
+            }
+            cleanupExpiredAndOverflow()
+            saveManifest()
+        } catch {
+            LogManager.shared.log("初始化章节缓存失败: \(error)", category: "缓存错误")
+        }
+    }
+    
+    private func isExpired(_ entry: ManifestEntry) -> Bool {
+        Date().timeIntervalSince1970 - entry.lastAccessTime > expirationInterval
+    }
+    
+    private func cleanupExpiredAndOverflow() {
+        let now = Date().timeIntervalSince1970
+        
+        let expired = manifest.filter { now - $0.value.lastAccessTime > expirationInterval }
+        for (key, entry) in expired {
+            removeEntry(for: key, entry: entry)
+        }
+        
+        if manifest.count > maxDiskEntries {
+            let sorted = manifest.sorted { $0.value.lastAccessTime < $1.value.lastAccessTime }
+            let overflowCount = manifest.count - maxDiskEntries
+            for (key, entry) in sorted.prefix(overflowCount) {
+                removeEntry(for: key, entry: entry)
+            }
+        }
+    }
+    
+    private func removeEntry(for key: String, entry: ManifestEntry) {
+        let fileURL = cacheDirectory.appendingPathComponent(entry.fileName)
+        try? fileManager.removeItem(at: fileURL)
+        manifest.removeValue(forKey: key)
+    }
+    
+    private func saveManifest() {
+        guard let data = try? JSONEncoder().encode(manifest) else {
+            return
+        }
+        try? data.write(to: manifestURL, options: .atomic)
+    }
+    
+    private func stableHash(_ text: String) -> String {
+        var hash: UInt64 = 1469598103934665603
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return String(hash, radix: 16)
+    }
+}
+
 class APIService: ObservableObject {
     static let shared = APIService()
     static let apiVersion = 5
@@ -10,8 +171,12 @@ class APIService: ObservableObject {
     @Published var isLoading = false
     @Published var errorMessage: String?
     
-    // 章节内容缓存
-    private var contentCache: [String: String] = [:]
+    // 章节内容缓存（内存 + 磁盘）
+    private let chapterCache = ChapterContentCacheStore()
+    
+    // 并发去重，避免同章节重复请求
+    private var inFlightChapterTasks: [String: Task<String, Error>] = [:]
+    private let inFlightLock = NSLock()
     
     var baseURL: String {
         let serverURL = UserPreferences.shared.serverURL
@@ -277,40 +442,115 @@ class APIService: ObservableObject {
     }
     
     // MARK: - 获取章节内容
-    func fetchChapterContent(bookUrl: String, bookSourceUrl: String?, index: Int) async throws -> String {
-        // 生成缓存key
-        let cacheKey = "\(bookUrl)_\(index)"
+    func fetchChapterContent(bookUrl: String, bookSourceUrl: String?, index: Int, bookName: String? = nil) async throws -> String {
+        let useSanitization = UserPreferences.shared.useReplaceRuleSanitization
+        let cacheKey = buildChapterCacheKey(
+            bookUrl: bookUrl,
+            bookSourceUrl: bookSourceUrl,
+            index: index,
+            useReplaceRuleSanitization: useSanitization
+        )
         
-        // 检查缓存
-        if let cachedContent = contentCache[cacheKey] {
+        if let cachedContent = await chapterCache.get(for: cacheKey) {
             return cachedContent
         }
         
-        var queryItems = [
-            URLQueryItem(name: "accessToken", value: accessToken),
-            URLQueryItem(name: "url", value: bookUrl),
-            URLQueryItem(name: "index", value: "\(index)"),
-            URLQueryItem(name: "type", value: "0")
-        ]
-        
-        if let bookSourceUrl = bookSourceUrl {
-            queryItems.append(URLQueryItem(name: "bookSourceUrl", value: bookSourceUrl))
+        let (task, isNewTask) = taskForChapterContent(cacheKey: cacheKey) {
+            Task<String, Error> { [weak self] in
+                guard let self = self else {
+                    throw NSError(domain: "APIService", code: -1, userInfo: [NSLocalizedDescriptionKey: "服务已释放"])
+                }
+                
+                if let cachedContent = await self.chapterCache.get(for: cacheKey) {
+                    return cachedContent
+                }
+                
+                var queryItems = [
+                    URLQueryItem(name: "accessToken", value: self.accessToken),
+                    URLQueryItem(name: "url", value: bookUrl),
+                    URLQueryItem(name: "index", value: "\(index)"),
+                    URLQueryItem(name: "type", value: "0")
+                ]
+                
+                if let bookSourceUrl = bookSourceUrl {
+                    queryItems.append(URLQueryItem(name: "bookSourceUrl", value: bookSourceUrl))
+                }
+                
+                let endpoint: String
+                if useSanitization {
+                    endpoint = "getBookContentNew"
+                    if let bookName = bookName, !bookName.isEmpty {
+                        queryItems.append(URLQueryItem(name: "bookname", value: bookName))
+                    }
+                    queryItems.append(URLQueryItem(name: "useReplaceRule", value: "1"))
+                } else {
+                    endpoint = "getBookContent"
+                }
+                
+                let (data, httpResponse) = try await self.requestWithFailback(endpoint: endpoint, queryItems: queryItems)
+                
+                guard httpResponse.statusCode == 200 else {
+                    throw NSError(domain: "APIService", code: 500, userInfo: [NSLocalizedDescriptionKey: "服务器错误"])
+                }
+                
+                if useSanitization {
+                    if let apiResponse = try? JSONDecoder().decode(APIResponse<ChapterContentResponse>.self, from: data),
+                       apiResponse.isSuccess,
+                       let contentResponse = apiResponse.data {
+                        let content = contentResponse.text
+                        await self.chapterCache.set(content, for: cacheKey)
+                        return content
+                    }
+                    
+                    // 兼容旧服务端返回结构
+                    let fallback = try JSONDecoder().decode(APIResponse<String>.self, from: data)
+                    if fallback.isSuccess, let content = fallback.data {
+                        await self.chapterCache.set(content, for: cacheKey)
+                        return content
+                    } else {
+                        throw NSError(domain: "APIService", code: 500, userInfo: [NSLocalizedDescriptionKey: fallback.errorMsg ?? "获取章节内容失败"])
+                    }
+                } else {
+                    let apiResponse = try JSONDecoder().decode(APIResponse<String>.self, from: data)
+                    
+                    if apiResponse.isSuccess, let content = apiResponse.data {
+                        await self.chapterCache.set(content, for: cacheKey)
+                        return content
+                    } else {
+                        throw NSError(domain: "APIService", code: 500, userInfo: [NSLocalizedDescriptionKey: apiResponse.errorMsg ?? "获取章节内容失败"])
+                    }
+                }
+            }
         }
         
-        let (data, httpResponse) = try await requestWithFailback(endpoint: "getBookContent", queryItems: queryItems)
-        
-        guard httpResponse.statusCode == 200 else {
-            throw NSError(domain: "APIService", code: 500, userInfo: [NSLocalizedDescriptionKey: "服务器错误"])
-        }
-        
-        let apiResponse = try JSONDecoder().decode(APIResponse<String>.self, from: data)
-        
-        if apiResponse.isSuccess, let content = apiResponse.data {
-            // 保存到缓存
-            contentCache[cacheKey] = content
-            return content
+        if isNewTask {
+            do {
+                defer { removeInFlightTask(for: cacheKey) }
+                return try await task.value
+            }
         } else {
-            throw NSError(domain: "APIService", code: 500, userInfo: [NSLocalizedDescriptionKey: apiResponse.errorMsg ?? "获取章节内容失败"])
+            return try await task.value
+        }
+    }
+    
+    // MARK: - 批量预载章节内容
+    func preloadChapterContents(bookUrl: String, bookSourceUrl: String?, indices: [Int], bookName: String? = nil) async {
+        let uniqueIndices = Array(Set(indices)).sorted()
+        guard !uniqueIndices.isEmpty else {
+            return
+        }
+        
+        await withTaskGroup(of: Void.self) { group in
+            for index in uniqueIndices {
+                group.addTask { [weak self] in
+                    guard let self = self else { return }
+                    do {
+                        _ = try await self.fetchChapterContent(bookUrl: bookUrl, bookSourceUrl: bookSourceUrl, index: index, bookName: bookName)
+                    } catch {
+                        LogManager.shared.log("章节预载失败 - index: \(index), error: \(error.localizedDescription)", category: "缓存")
+                    }
+                }
+            }
         }
     }
     
@@ -427,7 +667,10 @@ class APIService: ObservableObject {
     
     // MARK: - 清除本地缓存
     func clearLocalCache() {
-        contentCache.removeAll()
+        clearAllInFlightChapterTasks()
+        Task {
+            await chapterCache.removeAll()
+        }
     }
     
     // MARK: - 清除所有远程缓存
@@ -466,5 +709,36 @@ class APIService: ObservableObject {
                          userInfo: [NSLocalizedDescriptionKey: apiResponse.errorMsg ?? "清除缓存失败"])
         }
     }
+    
+    private func buildChapterCacheKey(bookUrl: String, bookSourceUrl: String?, index: Int, useReplaceRuleSanitization: Bool) -> String {
+        "\(bookUrl)|\(bookSourceUrl ?? "default")|\(index)|san:\(useReplaceRuleSanitization ? 1 : 0)"
+    }
+    
+    private func taskForChapterContent(cacheKey: String, create: () -> Task<String, Error>) -> (Task<String, Error>, Bool) {
+        inFlightLock.lock()
+        defer { inFlightLock.unlock() }
+        
+        if let existing = inFlightChapterTasks[cacheKey] {
+            return (existing, false)
+        }
+        
+        let task = create()
+        inFlightChapterTasks[cacheKey] = task
+        return (task, true)
+    }
+    
+    private func removeInFlightTask(for key: String) {
+        inFlightLock.lock()
+        defer { inFlightLock.unlock() }
+        inFlightChapterTasks.removeValue(forKey: key)
+    }
+    
+    private func clearAllInFlightChapterTasks() {
+        inFlightLock.lock()
+        let tasks = Array(inFlightChapterTasks.values)
+        inFlightChapterTasks.removeAll()
+        inFlightLock.unlock()
+        
+        tasks.forEach { $0.cancel() }
+    }
 }
-

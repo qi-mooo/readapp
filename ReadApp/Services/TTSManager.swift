@@ -29,13 +29,17 @@ class TTSManager: NSObject, ObservableObject {
     // 预载缓存
     private var audioCache: [Int: Data] = [:]  // 索引 -> 音频数据（索引-1为章节名，0~n为正文段落）
     private var preloadQueue: [Int] = []       // 等待预载的队列
+    private var activePreloadIndices: Set<Int> = []  // 正在下载的索引
     private var isPreloading = false           // 是否正在执行预载任务
+    private var preloadWorkerTask: Task<Void, Never>?
     private let maxPreloadRetries = 3          // 最大重试次数
     private let maxConcurrentDownloads = 6     // 最大并发下载数
     
     // 下一章预载
     private var nextChapterSentences: [String] = []  // 下一章的段落
     private var nextChapterCache: [Int: Data] = [:]  // 下一章的音频缓存（索引-1为章节名）
+    private var preloadedNextChapterIndex: Int?
+    private var nextChapterPreloadToken = UUID()
     
     // 章节名朗读
     private var isReadingChapterTitle = false  // 是否正在朗读章节名
@@ -287,9 +291,14 @@ class TTSManager: NSObject, ObservableObject {
         audioCache.removeAll()
         preloadedIndices.removeAll()
         preloadQueue.removeAll()
+        activePreloadIndices.removeAll()
         isPreloading = false
+        preloadWorkerTask?.cancel()
+        preloadWorkerTask = nil
         nextChapterCache.removeAll()
         nextChapterSentences.removeAll()
+        preloadedNextChapterIndex = nil
+        nextChapterPreloadToken = UUID()
         
         // 分句
         sentences = splitTextIntoSentences(text)
@@ -527,6 +536,10 @@ class TTSManager: NSObject, ObservableObject {
             return
         }
         
+        // 章节切换间隙先启动保活，避免后台被系统挂起
+        beginBackgroundTask()
+        startKeepAlive()
+        
         let chapterTitle = chapters[currentChapterIndex].title
         logger.log("开始朗读章节名: \(chapterTitle)", category: "TTS")
         
@@ -605,6 +618,10 @@ class TTSManager: NSObject, ObservableObject {
             nextChapter()
             return
         }
+        
+        // 段落切换间隙先启动保活，避免在请求下一段前进入暂停
+        beginBackgroundTask()
+        startKeepAlive()
         
         let sentence = sentences[currentSentenceIndex]
         
@@ -723,82 +740,103 @@ class TTSManager: NSObject, ObservableObject {
     private func startPreloading() {
         let preloadCount = UserPreferences.shared.ttsPreloadCount
         
-        // 预载当前章节的段落
-        if preloadCount > 0 {
-            let startIndex = currentSentenceIndex + 1
-            let endIndex = min(startIndex + preloadCount, sentences.count)
-            
-            // 计算需要预载的索引 (未缓存且不在队列中)
-            // 注意：这里简化为只检查缓存，每次都刷新队列以确保顺序优先
-            let neededIndices = (startIndex..<endIndex).filter { index in
-                audioCache[index] == nil
-            }
-            
-            if !neededIndices.isEmpty {
-                // 更新队列：覆盖为当前最需要的
-                preloadQueue = neededIndices
-                // 启动队列处理
-                processPreloadQueue()
-            } else {
-                // 当前段落都OK了，检查下一章
+        guard preloadCount > 0 else {
+            checkAndPreloadNextChapter()
+            return
+        }
+        
+        let startIndex = currentSentenceIndex + 1
+        let endIndex = min(startIndex + preloadCount, sentences.count)
+        
+        guard startIndex < endIndex else {
+            checkAndPreloadNextChapter()
+            return
+        }
+        
+        let neededIndices = (startIndex..<endIndex).filter { index in
+            audioCache[index] == nil && !activePreloadIndices.contains(index)
+        }
+        
+        if neededIndices.isEmpty {
+            if preloadQueue.isEmpty && activePreloadIndices.isEmpty {
                 checkAndPreloadNextChapter()
             }
-        } else {
-            checkAndPreloadNextChapter()
+            return
         }
+        
+        let neededSet = Set(neededIndices)
+        let existing = preloadQueue.filter { index in
+            !neededSet.contains(index)
+            && audioCache[index] == nil
+            && !activePreloadIndices.contains(index)
+            && index >= startIndex
+            && index < endIndex
+        }
+        
+        // 近期段落优先，旧队列中还有效的索引作为补充
+        preloadQueue = neededIndices + existing
+        processPreloadQueue()
     }
     
-    // MARK: - 处理预载队列 (并发下载 + 顺序优先)
+    private func dequeueNextPreloadBatch() -> [Int] {
+        preloadQueue = preloadQueue.filter { index in
+            audioCache[index] == nil && !activePreloadIndices.contains(index)
+        }
+        
+        guard !preloadQueue.isEmpty else {
+            return []
+        }
+        
+        let batchCount = min(maxConcurrentDownloads, preloadQueue.count)
+        let batch = Array(preloadQueue.prefix(batchCount))
+        preloadQueue.removeFirst(batchCount)
+        
+        for index in batch {
+            activePreloadIndices.insert(index)
+        }
+        
+        return batch
+    }
+    
+    // MARK: - 处理预载队列 (并发下载 + 动态优先级)
     private func processPreloadQueue() {
         guard !isPreloading else { return }
         
         isPreloading = true
+        preloadWorkerTask?.cancel()
         
-        Task { [weak self] in
+        preloadWorkerTask = Task { [weak self] in
             guard let self = self else { return }
             
-            await withTaskGroup(of: Void.self) { group in
-                var activeDownloads = 0
-                var queueIndex = 0
+            while !Task.isCancelled {
+                let batch = await MainActor.run { self.dequeueNextPreloadBatch() }
                 
-                while queueIndex < self.preloadQueue.count || activeDownloads > 0 {
-                    // 检查是否被停止
-                    if !self.isPreloading {
-                        group.cancelAll()
-                        break
-                    }
-                    
-                    // 启动新的下载任务（在并发限制内）
-                    while activeDownloads < self.maxConcurrentDownloads && queueIndex < self.preloadQueue.count {
-                        let index = self.preloadQueue[queueIndex]
-                        queueIndex += 1
-                        
-                        // 跳过已缓存的
-                        if self.audioCache[index] != nil {
-                            continue
-                        }
-                        
-                        activeDownloads += 1
-                        
+                if batch.isEmpty {
+                    break
+                }
+                
+                await withTaskGroup(of: Void.self) { group in
+                    for index in batch {
                         group.addTask { [weak self] in
                             guard let self = self else { return }
                             await self.downloadAudioWithRetry(at: index)
+                            await MainActor.run {
+                                _ = self.activePreloadIndices.remove(index)
+                            }
                         }
-                    }
-                    
-                    // 等待至少一个任务完成
-                    if activeDownloads > 0 {
-                        await group.next()
-                        activeDownloads -= 1
                     }
                 }
             }
             
-            self.isPreloading = false
-            
-            // 队列空了，检查下一章
             await MainActor.run {
-                self.checkAndPreloadNextChapter()
+                self.isPreloading = false
+                self.preloadWorkerTask = nil
+            }
+            
+            await MainActor.run {
+                if self.preloadQueue.isEmpty && self.activePreloadIndices.isEmpty {
+                    self.checkAndPreloadNextChapter()
+                }
             }
         }
     }
@@ -806,8 +844,7 @@ class TTSManager: NSObject, ObservableObject {
     // MARK: - 带重试的下载
     private func downloadAudioWithRetry(at index: Int) async {
         for attempt in 0...maxPreloadRetries {
-            // 检查是否还需要下载 (可能用户已经切走了)
-            if !isPreloading { return }
+            if Task.isCancelled { return }
             
             let success = await downloadAudio(at: index)
             if success {
@@ -830,7 +867,7 @@ class TTSManager: NSObject, ObservableObject {
         // 跳过纯标点
         if isPunctuationOnly(sentence) {
             await MainActor.run {
-                preloadedIndices.insert(index)
+                _ = preloadedIndices.insert(index)
             }
             return true
         }
@@ -869,9 +906,6 @@ class TTSManager: NSObject, ObservableObject {
     
     private func playAudioWithData(data: Data) {
         do {
-            // 播放正式音频前，停止静音保活
-            stopKeepAlive()
-            
             // 使用 AVAudioPlayer 播放下载的数据
             audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer?.delegate = self
@@ -885,6 +919,8 @@ class TTSManager: NSObject, ObservableObject {
             if success {
                 logger.log("✅ 音频开始播放", category: "TTS")
                 isLoading = false
+                // 新音频已经起播，再关闭静音保活，避免段落切换间隙掉线
+                stopKeepAlive()
                 // 延长后台任务
                 beginBackgroundTask()
             } else {
@@ -961,12 +997,19 @@ class TTSManager: NSObject, ObservableObject {
     
     // MARK: - 检查当前章节是否预载完成，并预载下一章
     private func checkAndPreloadNextChapter() {
-        // 如果已经在预载下一章，跳过
-        guard nextChapterSentences.isEmpty else {
+        guard currentChapterIndex < chapters.count - 1 else {
             return
         }
         
-        guard currentChapterIndex < chapters.count - 1 else {
+        let expectedNextChapterIndex = currentChapterIndex + 1
+        
+        if let preloadedIndex = preloadedNextChapterIndex, preloadedIndex != expectedNextChapterIndex {
+            nextChapterCache.removeAll()
+            nextChapterSentences.removeAll()
+            preloadedNextChapterIndex = nil
+        }
+        
+        if preloadedNextChapterIndex == expectedNextChapterIndex, !nextChapterSentences.isEmpty {
             return
         }
         
@@ -985,25 +1028,43 @@ class TTSManager: NSObject, ObservableObject {
 
     // MARK: - 预载下一章
     private func preloadNextChapter() {
-        // 如果已经在预载下一章或已有下一章数据，跳过
-        guard nextChapterSentences.isEmpty else { return }
         guard currentChapterIndex < chapters.count - 1 else { return }
         
         let nextChapterIndex = currentChapterIndex + 1
+        
+        if preloadedNextChapterIndex == nextChapterIndex, !nextChapterSentences.isEmpty {
+            return
+        }
+        
+        if preloadedNextChapterIndex != nextChapterIndex {
+            nextChapterCache.removeAll()
+            nextChapterSentences.removeAll()
+        }
+        
+        preloadedNextChapterIndex = nextChapterIndex
+        let preloadToken = UUID()
+        nextChapterPreloadToken = preloadToken
+        
         logger.log("开始预载下一章: \(nextChapterIndex)", category: "TTS")
         
         // 预载下一章的章节名
-        preloadNextChapterTitle(chapterIndex: nextChapterIndex)
+        preloadNextChapterTitle(chapterIndex: nextChapterIndex, token: preloadToken)
         
         Task {
             do {
                 let content = try await APIService.shared.fetchChapterContent(
                     bookUrl: bookUrl,
                     bookSourceUrl: bookSourceUrl,
-                    index: nextChapterIndex
+                    index: nextChapterIndex,
+                    bookName: bookTitle
                 )
                 
                 await MainActor.run {
+                    guard self.nextChapterPreloadToken == preloadToken,
+                          self.preloadedNextChapterIndex == nextChapterIndex else {
+                        return
+                    }
+                    
                     // 分段
                     nextChapterSentences = splitTextIntoSentences(content)
                     logger.log("下一章分段完成，共 \(nextChapterSentences.count) 段", category: "TTS")
@@ -1014,18 +1075,27 @@ class TTSManager: NSObject, ObservableObject {
                     logger.log("开始预载下一章的前 \(preloadCount) 段音频", category: "TTS")
                     
                     for i in 0..<preloadCount {
-                        preloadNextChapterAudio(at: i)
+                        preloadNextChapterAudio(at: i, chapterIndex: nextChapterIndex, token: preloadToken)
                     }
                 }
             } catch {
+                await MainActor.run {
+                    guard self.nextChapterPreloadToken == preloadToken else { return }
+                    if self.preloadedNextChapterIndex == nextChapterIndex {
+                        self.preloadedNextChapterIndex = nil
+                        self.nextChapterCache.removeAll()
+                        self.nextChapterSentences.removeAll()
+                    }
+                }
                 logger.log("预载下一章失败: \(error)", category: "TTS错误")
             }
         }
     }
     
     // MARK: - 预载下一章的章节名
-    private func preloadNextChapterTitle(chapterIndex: Int) {
+    private func preloadNextChapterTitle(chapterIndex: Int, token: UUID) {
         guard chapterIndex < chapters.count else { return }
+        guard preloadedNextChapterIndex == chapterIndex else { return }
         guard nextChapterCache[-1] == nil else { return }
         
         let chapterTitle = chapters[chapterIndex].title
@@ -1051,6 +1121,11 @@ class TTSManager: NSObject, ObservableObject {
                 let (data, response) = try await URLSession.shared.data(from: audioURL)
                 
                 await MainActor.run {
+                    guard self.nextChapterPreloadToken == token,
+                          self.preloadedNextChapterIndex == chapterIndex else {
+                        return
+                    }
+                    
                     if let httpResponse = response as? HTTPURLResponse,
                        httpResponse.statusCode == 200,
                        let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
@@ -1067,7 +1142,8 @@ class TTSManager: NSObject, ObservableObject {
     }
     
     // MARK: - 预载下一章的音频
-    private func preloadNextChapterAudio(at index: Int) {
+    private func preloadNextChapterAudio(at index: Int, chapterIndex: Int, token: UUID) {
+        guard preloadedNextChapterIndex == chapterIndex else { return }
         guard index < nextChapterSentences.count else { return }
         guard nextChapterCache[index] == nil else { return }
         
@@ -1089,6 +1165,11 @@ class TTSManager: NSObject, ObservableObject {
                 let (data, response) = try await URLSession.shared.data(from: url)
                 
                 await MainActor.run {
+                    guard self.nextChapterPreloadToken == token,
+                          self.preloadedNextChapterIndex == chapterIndex else {
+                        return
+                    }
+                    
                     if let httpResponse = response as? HTTPURLResponse,
                        httpResponse.statusCode == 200,
                        let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
@@ -1106,6 +1187,15 @@ class TTSManager: NSObject, ObservableObject {
     
     // MARK: - 停止
     func stop() {
+        if !bookUrl.isEmpty {
+            let safeSentenceIndex = max(currentSentenceIndex, 0)
+            UserPreferences.shared.saveTTSProgress(
+                bookUrl: bookUrl,
+                chapterIndex: currentChapterIndex,
+                sentenceIndex: safeSentenceIndex
+            )
+        }
+        
         stopKeepAlive()
         audioPlayer?.stop()
         audioPlayer = nil
@@ -1117,9 +1207,14 @@ class TTSManager: NSObject, ObservableObject {
         // 清理缓存
         audioCache.removeAll()
         preloadQueue.removeAll()
+        activePreloadIndices.removeAll()
         isPreloading = false
+        preloadWorkerTask?.cancel()
+        preloadWorkerTask = nil
         nextChapterCache.removeAll()
         nextChapterSentences.removeAll()
+        preloadedNextChapterIndex = nil
+        nextChapterPreloadToken = UUID()
         coverArtwork = nil  // 清理封面缓存
         // 结束后台任务
         endBackgroundTask()
@@ -1144,8 +1239,21 @@ class TTSManager: NSObject, ObservableObject {
     
     // MARK: - 加载并朗读章节
     private func loadAndReadChapter() {
+        preloadWorkerTask?.cancel()
+        preloadWorkerTask = nil
+        isPreloading = false
+        preloadQueue.removeAll()
+        activePreloadIndices.removeAll()
+        nextChapterPreloadToken = UUID()
+        
+        if let preloadedIndex = preloadedNextChapterIndex, preloadedIndex != currentChapterIndex {
+            nextChapterCache.removeAll()
+            nextChapterSentences.removeAll()
+            preloadedNextChapterIndex = nil
+        }
+        
         // 检查是否有预载的下一章数据
-        if !nextChapterSentences.isEmpty {
+        if preloadedNextChapterIndex == currentChapterIndex, !nextChapterSentences.isEmpty {
             logger.log("使用已预载的下一章数据", category: "TTS")
             
             // 停止当前播放
@@ -1160,10 +1268,13 @@ class TTSManager: NSObject, ObservableObject {
             // 将下一章的缓存移动到当前章节（包括章节名索引-1和正文段落）
             audioCache = nextChapterCache
             preloadedIndices = Set(nextChapterCache.keys)
+            preloadQueue.removeAll()
+            activePreloadIndices.removeAll()
             
             // 清空下一章缓存
             nextChapterCache.removeAll()
             nextChapterSentences.removeAll()
+            preloadedNextChapterIndex = nil
             
             isPlaying = true
             isPaused = false
@@ -1192,7 +1303,8 @@ class TTSManager: NSObject, ObservableObject {
                 let content = try await APIService.shared.fetchChapterContent(
                     bookUrl: bookUrl,
                     bookSourceUrl: bookSourceUrl,
-                    index: currentChapterIndex
+                    index: currentChapterIndex,
+                    bookName: bookTitle
                 )
                 let loadTime = Date().timeIntervalSince(startTime)
                 
@@ -1210,7 +1322,10 @@ class TTSManager: NSObject, ObservableObject {
                     // 清空当前章节的缓存
                     audioCache.removeAll()
                     preloadQueue.removeAll()
+                    activePreloadIndices.removeAll()
                     isPreloading = false
+                    preloadWorkerTask?.cancel()
+                    preloadWorkerTask = nil
                     preloadedIndices.removeAll()
                     
                     isPlaying = true
