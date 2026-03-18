@@ -49,7 +49,9 @@ class TTSManager: NSObject, ObservableObject {
 
     // 淡出 timer
     private var fadeOutTimer: Timer?
-    private let fadeDuration: TimeInterval = 0.4
+    private var fadeDuration: TimeInterval { UserPreferences.shared.ttsFadeDuration }
+    private var fadeVolume: Float { Float(UserPreferences.shared.ttsFadeVolume) }
+    private var fadeStartVolume: Float { Float(UserPreferences.shared.ttsFadeStartVolume) }
 
     // 后台保活
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -467,11 +469,13 @@ class TTSManager: NSObject, ObservableObject {
     // MARK: - 淡出调度
     private func scheduleFadeOut() {
         cancelFadeOut()
+        let fd = fadeDuration
         guard UserPreferences.shared.ttsFadeEnabled,
               let player = audioPlayer,
-              player.duration > fadeDuration * 2 else { return }
+              player.duration > fd * 2 else { return }
 
-        let fireDelay = player.duration - fadeDuration
+        let fireDelay = player.duration - fd
+        logger.log("⏱️ 淡出将在 \(String(format: "%.2f", fireDelay))s 后触发（时长: \(String(format: "%.2f", player.duration))s）", category: "TTS")
         fadeOutTimer = Timer.scheduledTimer(withTimeInterval: fireDelay, repeats: false) { [weak self] _ in
             guard let self, let p = self.audioPlayer, p.isPlaying else { return }
             p.setVolume(0.0, fadeDuration: self.fadeDuration)
@@ -888,9 +892,10 @@ class TTSManager: NSObject, ObservableObject {
             // 使用 AVAudioPlayer 播放下载的数据
             audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer?.delegate = self
+            audioPlayer?.prepareToPlay()  // 预解码，让 duration 准确，减少播放延迟
 
             let fadeEnabled = UserPreferences.shared.ttsFadeEnabled
-            audioPlayer?.volume = fadeEnabled ? 0.0 : 1.0
+            audioPlayer?.volume = fadeEnabled ? fadeStartVolume : 1.0
 
             logger.log("创建 AVAudioPlayer 成功", category: "TTS")
             logger.log("音频时长: \(audioPlayer?.duration ?? 0) 秒", category: "TTS")
@@ -906,7 +911,7 @@ class TTSManager: NSObject, ObservableObject {
                 beginBackgroundTask()
                 // 淡入
                 if fadeEnabled {
-                    audioPlayer?.setVolume(1.0, fadeDuration: fadeDuration)
+                    audioPlayer?.setVolume(fadeVolume, fadeDuration: fadeDuration)
                 }
                 // 启动淡出 timer
                 scheduleFadeOut()

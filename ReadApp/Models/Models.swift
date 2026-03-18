@@ -162,6 +162,24 @@ class UserPreferences: ObservableObject {
             UserDefaults.standard.set(ttsFadeEnabled, forKey: "ttsFadeEnabled")
         }
     }
+
+    @Published var ttsFadeVolume: Double {
+        didSet {
+            UserDefaults.standard.set(ttsFadeVolume, forKey: "ttsFadeVolume")
+        }
+    }
+
+    @Published var ttsFadeDuration: Double {
+        didSet {
+            UserDefaults.standard.set(ttsFadeDuration, forKey: "ttsFadeDuration")
+        }
+    }
+
+    @Published var ttsFadeStartVolume: Double {
+        didSet {
+            UserDefaults.standard.set(ttsFadeStartVolume, forKey: "ttsFadeStartVolume")
+        }
+    }
     
     // TTS进度记录：bookUrl -> (chapterIndex, sentenceIndex)
     private var ttsProgress: [String: (Int, Int)] {
@@ -218,10 +236,19 @@ class UserPreferences: ObservableObject {
         }
 
         if UserDefaults.standard.object(forKey: "ttsFadeEnabled") == nil {
-            self.ttsFadeEnabled = true
+            self.ttsFadeEnabled = false
         } else {
             self.ttsFadeEnabled = UserDefaults.standard.bool(forKey: "ttsFadeEnabled")
         }
+
+        let savedFadeVolume = UserDefaults.standard.double(forKey: "ttsFadeVolume")
+        self.ttsFadeVolume = savedFadeVolume == 0 ? 0.85 : savedFadeVolume
+
+        let savedFadeDuration = UserDefaults.standard.double(forKey: "ttsFadeDuration")
+        self.ttsFadeDuration = savedFadeDuration == 0 ? 0.4 : savedFadeDuration
+
+        let savedFadeStartVolume = UserDefaults.standard.double(forKey: "ttsFadeStartVolume")
+        self.ttsFadeStartVolume = UserDefaults.standard.object(forKey: "ttsFadeStartVolume") == nil ? 0.8 : savedFadeStartVolume
     }
     
     func logout() {

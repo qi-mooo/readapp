@@ -592,7 +592,7 @@ class APIService: ObservableObject {
         }
         
         let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? ""
-        guard contentType.contains("audio"), data.count >= 10000 else {
+        guard contentType.contains("audio"), !data.isEmpty else {
             throw NSError(domain: "APIService", code: 500, userInfo: [NSLocalizedDescriptionKey: "TTS 返回数据无效"])
         }
         

@@ -113,6 +113,32 @@ struct SettingsView: View {
                     Text("播放每段音频时渐入，结束前渐出，使段落切换更自然")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    if preferences.ttsFadeEnabled {
+                        HStack {
+                            Text("淡入音量")
+                            Spacer()
+                            Text("\(Int(preferences.ttsFadeStartVolume * 100))%")
+                                .foregroundColor(.secondary)
+                        }
+                        Slider(value: $preferences.ttsFadeStartVolume, in: 0.0...0.9, step: 0.05)
+
+                        HStack {
+                            Text("淡出音量")
+                            Spacer()
+                            Text("\(Int(preferences.ttsFadeVolume * 100))%")
+                                .foregroundColor(.secondary)
+                        }
+                        Slider(value: $preferences.ttsFadeVolume, in: 0.5...1.0, step: 0.05)
+
+                        HStack {
+                            Text("渐变时长")
+                            Spacer()
+                            Text(String(format: "%.1f 秒", preferences.ttsFadeDuration))
+                                .foregroundColor(.secondary)
+                        }
+                        Slider(value: $preferences.ttsFadeDuration, in: 0.1...1.0, step: 0.1)
+                    }
                 }
                 
                 Section(header: Text("书架设置")) {
