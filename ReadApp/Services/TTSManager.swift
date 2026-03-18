@@ -1299,6 +1299,11 @@ class TTSManager: NSObject, ObservableObject {
 // MARK: - AVAudioPlayerDelegate
 extension TTSManager: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        // 忽略非当前 player 的回调（旧 player 释放时可能触发）
+        guard player === audioPlayer else {
+            logger.log("⚠️ 忽略过期 player 的 didFinishPlaying 回调", category: "TTS")
+            return
+        }
         logger.log("音频播放完成 - 成功: \(flag)", category: "TTS")
         
         // 播放间隙启动保活
@@ -1323,6 +1328,7 @@ extension TTSManager: AVAudioPlayerDelegate {
     }
     
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        guard player === audioPlayer else { return }
         if let error = error {
             logger.log("❌ 音频解码错误: \(error.localizedDescription)", category: "TTS错误")
         }
