@@ -3,7 +3,6 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var apiService: APIService
     @StateObject private var preferences = UserPreferences.shared
-    @StateObject private var tailscaleManager = TailscaleTunnelManager.shared
     @Environment(\.dismiss) var dismiss
     
     @State private var showTTSSelection = false
@@ -33,15 +32,6 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .lineLimit(1)
-                        }
-                        
-                        HStack {
-                            Text("Tailscale")
-                                .font(.caption)
-                            Spacer()
-                            Text(tailscaleManager.statusText)
-                                .font(.caption2)
-                                .foregroundColor(tailscaleManager.status == .connected ? .green : .secondary)
                         }
                     }
                     
@@ -227,7 +217,6 @@ struct SettingsView: View {
             }
             .task {
                 await loadTTSName()
-                await tailscaleManager.refreshConfiguration()
             }
             .onChange(of: preferences.selectedTTSId) { _ in
                 Task {

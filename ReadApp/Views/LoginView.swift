@@ -14,7 +14,6 @@ struct LoginView: View {
             VStack(spacing: 20) {
                 Spacer()
                 
-                // Logo 或应用名称
                 Image(systemName: "book.fill")
                     .font(.system(size: 80))
                     .foregroundColor(.blue)
@@ -25,7 +24,6 @@ struct LoginView: View {
                 
                 Spacer()
                 
-                // 服务器地址显示
                 if !preferences.serverURL.isEmpty {
                     HStack {
                         Text("服务器:")
@@ -33,16 +31,16 @@ struct LoginView: View {
                         Text(preferences.serverURL)
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            .lineLimit(1)
                         Spacer()
                         Button(action: { showServerSettings = true }) {
                             Image(systemName: "gear")
                                 .foregroundColor(.blue)
                         }
                     }
-                    .padding(.horizontal)
+                    .padding(.horizontal, 20)
                 }
                 
-                // 登录表单
                 VStack(spacing: 16) {
                     TextField("用户名", text: $username)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -80,7 +78,6 @@ struct LoginView: View {
                 }
                 .padding(.horizontal, 30)
                 
-                // 服务器设置按钮
                 if preferences.serverURL.isEmpty {
                     Button(action: { showServerSettings = true }) {
                         HStack {
@@ -142,30 +139,15 @@ struct ServerSettingsView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("局域网服务器配置")) {
-                    TextField("局域网服务器地址", text: $preferences.serverURL)
+                Section(header: Text("服务器配置")) {
+                    TextField("服务器地址", text: $preferences.serverURL)
                         .autocapitalization(.none)
                         .keyboardType(.URL)
                         .disableAutocorrection(true)
-                    
+
                     Text("示例: http://192.168.1.100:8080")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                }
-                
-                Section(header: Text("公网服务器配置（可选）")) {
-                    TextField("公网服务器地址", text: $preferences.publicServerURL)
-                        .autocapitalization(.none)
-                        .keyboardType(.URL)
-                        .disableAutocorrection(true)
-                    
-                    Text("示例: https://yourdomain.com:8080")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    
-                    Text("当局域网服务器无法连接时自动使用公网服务器")
-                        .font(.caption)
-                        .foregroundColor(.green)
                 }
                 
                 Section {
@@ -186,7 +168,7 @@ struct ServerSettingsView: View {
                                 Text("测试中...")
                             } else {
                                 Image(systemName: "network")
-                                Text("测试连接")
+                                Text("测试服务器连接")
                             }
                             Spacer()
                         }
@@ -206,16 +188,12 @@ struct ServerSettingsView: View {
                 
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("⚠️ 连接失败？请检查：")
+                        Text("连接失败？请检查：")
                             .font(.caption)
                             .fontWeight(.semibold)
-                        Text("1. 服务器地址格式: http://IP:端口")
+                        Text("1. 服务器已启动并监听正确端口")
                             .font(.caption)
-                        Text("2. 设备与服务器在同一网络")
-                            .font(.caption)
-                        Text("3. 服务器已启动并监听正确端口")
-                            .font(.caption)
-                        Text("4. 防火墙未阻止连接")
+                        Text("2. 必须填写 http:// 或 https:// 前缀")
                             .font(.caption)
                     }
                     .foregroundColor(.secondary)
@@ -229,7 +207,7 @@ struct ServerSettingsView: View {
                         dismiss()
                     }
                 }
-                
+
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("完成") {
                         dismiss()
@@ -246,61 +224,20 @@ struct ServerSettingsView: View {
         
         Task {
             do {
-                let serverURL = preferences.serverURL
-                let testURL = "\(serverURL)/api/\(APIService.apiVersion)/login?username=test&password=test&model=test"
-                
-                LogManager.shared.log("测试连接: \(testURL)", category: "连接测试")
-                
-                guard let url = URL(string: testURL) else {
-                    await MainActor.run {
-                        testResult = "服务器地址格式错误"
-                        testSuccess = false
-                        testingConnection = false
-                    }
-                    return
-                }
-                
-                var request = URLRequest(url: url)
-                request.httpMethod = "GET"
-                request.timeoutInterval = 10
-                
-                let (data, response) = try await URLSession.shared.data(for: request)
-                
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    await MainActor.run {
-                        testResult = "无效的响应"
-                        testSuccess = false
-                        testingConnection = false
-                    }
-                    return
-                }
-                
-                LogManager.shared.log("连接测试响应码: \(httpResponse.statusCode)", category: "连接测试")
-                
-                if httpResponse.statusCode == 200 || httpResponse.statusCode == 401 {
-                    // 200 或 401 都说明服务器可以访问（401 是因为测试账号密码不对，但服务器是通的）
-                    await MainActor.run {
-                        testResult = "✓ 连接成功！服务器可访问"
-                        testSuccess = true
-                        testingConnection = false
-                    }
-                } else {
-                    let responseText = String(data: data, encoding: .utf8) ?? ""
-                    await MainActor.run {
-                        testResult = "服务器返回错误 (状态码: \(httpResponse.statusCode))"
-                        testSuccess = false
-                        testingConnection = false
-                    }
-                    LogManager.shared.log("连接测试失败: \(responseText)", category: "连接测试")
+                try await APIService.shared.testServerConnection()
+                await MainActor.run {
+                    testResult = "✓ 连接成功，服务器可访问"
+                    testSuccess = true
+                    testingConnection = false
                 }
             } catch {
                 let errorMessage: String
                 if let nsError = error as NSError?, nsError.domain == NSURLErrorDomain {
                     switch nsError.code {
                     case NSURLErrorTimedOut:
-                        errorMessage = "连接超时 - 请检查服务器地址和网络"
+                        errorMessage = "连接超时 - 请检查服务器地址"
                     case NSURLErrorCannotConnectToHost:
-                        errorMessage = "无法连接到服务器 - 请检查地址和端口"
+                        errorMessage = "无法连接到服务器 - 请检查服务器地址"
                     case NSURLErrorNotConnectedToInternet:
                         errorMessage = "设备未连接到网络"
                     default:
@@ -321,7 +258,3 @@ struct ServerSettingsView: View {
         }
     }
 }
-
-
-
-
