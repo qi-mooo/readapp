@@ -35,6 +35,9 @@ class TTSManager: NSObject, ObservableObject {
     private let maxPreloadRetries = 3          // 最大重试次数
     private let maxConcurrentDownloads = 6     // 最大并发下载数
     
+    // 当前段落下载 token，用于作废过期的异步下载 Task
+    private var currentPlayToken = UUID()
+
     // 下一章预载
     private var nextChapterSentences: [String] = []  // 下一章的段落
     private var nextChapterCache: [Int: Data] = [:]  // 下一章的音频缓存（索引-1为章节名）
@@ -338,7 +341,9 @@ class TTSManager: NSObject, ObservableObject {
     func previousSentence() {
         if currentSentenceIndex > 0 {
             currentSentenceIndex -= 1
+            currentPlayToken = UUID()
             audioPlayer?.stop()
+            audioPlayer?.delegate = nil
             audioPlayer = nil
             
             // 保存进度
@@ -354,7 +359,9 @@ class TTSManager: NSObject, ObservableObject {
     func nextSentence() {
         if currentSentenceIndex < sentences.count - 1 {
             currentSentenceIndex += 1
+            currentPlayToken = UUID()
             audioPlayer?.stop()
+            audioPlayer?.delegate = nil
             audioPlayer = nil
             
             // 保存进度
@@ -566,39 +573,20 @@ class TTSManager: NSObject, ObservableObject {
         
         let speechRate = UserPreferences.shared.speechRate
         
-        // 构建 TTS 音频 URL
-        guard let audioURL = APIService.shared.buildTTSAudioURL(
-            ttsId: ttsId,
-            text: chapterTitle,
-            speechRate: speechRate
-        ) else {
-            logger.log("构建章节名音频 URL 失败", category: "TTS错误")
-            isReadingChapterTitle = false
-            speakNextSentence()
-            return
-        }
-        
         // 播放音频
         Task {
             do {
-                let (data, response) = try await URLSession.shared.data(from: audioURL)
+                let data = try await APIService.shared.fetchTTSAudioData(
+                    ttsId: ttsId,
+                    text: chapterTitle,
+                    speechRate: speechRate
+                )
                 
                 await MainActor.run {
-                    // 检查HTTP响应
-                    if let httpResponse = response as? HTTPURLResponse,
-                       httpResponse.statusCode == 200,
-                       let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
-                       contentType.contains("audio"),
-                       data.count >= 10000 {
-                        playAudioWithData(data: data)
-                        // 在章节名开始播放时就启动预载，避免阻塞
-                        logger.log("章节名播放中，同时启动内容预载", category: "TTS")
-                        startPreloading()
-                    } else {
-                        logger.log("章节名音频无效，跳过", category: "TTS")
-                        isReadingChapterTitle = false
-                        speakNextSentence()
-                    }
+                    playAudioWithData(data: data)
+                    // 在章节名开始播放时就启动预载，避免阻塞
+                    logger.log("章节名播放中，同时启动内容预载", category: "TTS")
+                    startPreloading()
                 }
             } catch {
                 logger.log("章节名音频下载失败: \(error)", category: "TTS错误")
@@ -649,20 +637,8 @@ class TTSManager: NSObject, ObservableObject {
         logger.log("朗读句子 \(currentSentenceIndex + 1)/\(totalSentences) - 语速: \(speechRate)", category: "TTS")
         logger.log("句子内容: \(sentence.prefix(50))...", category: "TTS")
         
-        // 构建 TTS 音频 URL
-        guard let audioURL = APIService.shared.buildTTSAudioURL(
-            ttsId: ttsId,
-            text: sentence,
-            speechRate: speechRate
-        ) else {
-            logger.log("构建音频 URL 失败", category: "TTS错误")
-            currentSentenceIndex += 1
-            speakNextSentence()
-            return
-        }
-        
         // 播放音频
-        playAudio(url: audioURL)
+        playAudio(text: sentence, ttsId: ttsId, speechRate: speechRate)
         
         // 更新锁屏信息
         if currentChapterIndex < chapters.count {
@@ -671,10 +647,8 @@ class TTSManager: NSObject, ObservableObject {
     }
     
     // MARK: - 播放音频
-    private func playAudio(url: URL) {
+    private func playAudio(text: String, ttsId: String, speechRate: Double) {
         isLoading = true
-        
-        logger.log("TTS 音频 URL: \(url.absoluteString)", category: "TTS")
         
         // 检查缓存
         if let cachedData = audioCache[currentSentenceIndex] {
@@ -686,40 +660,24 @@ class TTSManager: NSObject, ObservableObject {
         }
         
         // 下载音频数据并使用 AVAudioPlayer 播放
+        let token = UUID()
+        currentPlayToken = token
         Task {
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
-                logger.log("✅ URL可访问，数据大小: \(data.count) 字节", category: "TTS")
-                
-                var isValidAudio = false
-                if let httpResponse = response as? HTTPURLResponse {
-                    logger.log("HTTP状态码: \(httpResponse.statusCode)", category: "TTS")
-                    let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "unknown"
-                    logger.log("Content-Type: \(contentType)", category: "TTS")
-                    
-                    // 验证是否是有效的音频数据
-                    if httpResponse.statusCode == 200 && contentType.contains("audio") && data.count >= 10000 {
-                        isValidAudio = true
-                    }
-                }
-                
-                // 检查数据是否为有效音频
-                if !isValidAudio || data.count < 10000 {
-                    logger.log("❌ 数据无效或太小（需要至少10KB），实际: \(data.count) 字节", category: "TTS错误")
-                    if data.count < 2000, let text = String(data: data, encoding: .utf8) {
-                        logger.log("返回内容: \(text.prefix(500))", category: "TTS错误")
-                    }
-                    await MainActor.run {
-                        isLoading = false
-                        logger.log("⚠️ 音频无效，尝试下一段", category: "TTS")
-                        currentSentenceIndex += 1
-                        speakNextSentence()
-                    }
-                    return
-                }
-                
+                let data = try await APIService.shared.fetchTTSAudioData(
+                    ttsId: ttsId,
+                    text: text,
+                    speechRate: speechRate
+                )
+                logger.log("✅ 音频下载成功，大小: \(data.count) 字节", category: "TTS")
+
                 // 在主线程创建并播放音频
                 await MainActor.run {
+                    // 如果 token 已过期（用户跳段/停止），丢弃本次下载结果
+                    guard self.currentPlayToken == token else {
+                        self.logger.log("⚠️ 下载结果已过期，丢弃", category: "TTS")
+                        return
+                    }
                     playAudioWithData(data: data)
                     // 触发预载
                     startPreloading()
@@ -727,6 +685,7 @@ class TTSManager: NSObject, ObservableObject {
             } catch {
                 logger.log("❌ 网络错误: \(error.localizedDescription)", category: "TTS错误")
                 await MainActor.run {
+                    guard self.currentPlayToken == token else { return }
                     isLoading = false
                     logger.log("⚠️ 网络错误，尝试下一段", category: "TTS")
                     currentSentenceIndex += 1
@@ -873,30 +832,21 @@ class TTSManager: NSObject, ObservableObject {
         }
         
         let speechRate = UserPreferences.shared.speechRate
-        guard let encodedText = sentence.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return false }
-        
-        let urlString = "\(UserPreferences.shared.serverURL)/api/\(APIService.apiVersion)/tts?accessToken=\(UserPreferences.shared.accessToken)&id=\(UserPreferences.shared.selectedTTSId)&speakText=\(encodedText)&speechRate=\(speechRate)"
-        
-        guard let url = URL(string: urlString) else { return false }
+        let ttsId = UserPreferences.shared.selectedTTSId
+        guard !ttsId.isEmpty else { return false }
         
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let data = try await APIService.shared.fetchTTSAudioData(
+                ttsId: ttsId,
+                text: sentence,
+                speechRate: speechRate
+            )
             
             return await MainActor.run {
-                // 检查HTTP响应
-                if let httpResponse = response as? HTTPURLResponse,
-                   httpResponse.statusCode == 200,
-                   let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
-                   contentType.contains("audio"),
-                   data.count >= 10000 {
-                    
-                    audioCache[index] = data
-                    preloadedIndices.insert(index)
-                    logger.log("✅ 顺序预载成功 - 索引: \(index), 大小: \(data.count)", category: "TTS")
-                    return true
-                } else {
-                    return false
-                }
+                audioCache[index] = data
+                preloadedIndices.insert(index)
+                logger.log("✅ 顺序预载成功 - 索引: \(index), 大小: \(data.count)", category: "TTS")
+                return true
             }
         } catch {
             logger.log("预载网络错误: \(error)", category: "TTS错误")
@@ -906,6 +856,11 @@ class TTSManager: NSObject, ObservableObject {
     
     private func playAudioWithData(data: Data) {
         do {
+            // 先停掉旧 player 并清空 delegate，防止其释放时触发 audioPlayerDidFinishPlaying
+            audioPlayer?.stop()
+            audioPlayer?.delegate = nil
+            audioPlayer = nil
+
             // 使用 AVAudioPlayer 播放下载的数据
             audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer?.delegate = self
@@ -1106,19 +1061,13 @@ class TTSManager: NSObject, ObservableObject {
         
         logger.log("预载下一章章节名: \(chapterTitle)", category: "TTS")
         
-        // 构建 TTS 音频 URL
-        guard let audioURL = APIService.shared.buildTTSAudioURL(
-            ttsId: ttsId,
-            text: chapterTitle,
-            speechRate: speechRate
-        ) else {
-            logger.log("构建下一章章节名音频 URL 失败", category: "TTS错误")
-            return
-        }
-        
         Task {
             do {
-                let (data, response) = try await URLSession.shared.data(from: audioURL)
+                let data = try await APIService.shared.fetchTTSAudioData(
+                    ttsId: ttsId,
+                    text: chapterTitle,
+                    speechRate: speechRate
+                )
                 
                 await MainActor.run {
                     guard self.nextChapterPreloadToken == token,
@@ -1126,14 +1075,8 @@ class TTSManager: NSObject, ObservableObject {
                         return
                     }
                     
-                    if let httpResponse = response as? HTTPURLResponse,
-                       httpResponse.statusCode == 200,
-                       let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
-                       contentType.contains("audio"),
-                       data.count >= 10000 {
-                        nextChapterCache[-1] = data
-                        logger.log("✅ 下一章章节名预载成功，大小: \(data.count) 字节", category: "TTS")
-                    }
+                    nextChapterCache[-1] = data
+                    logger.log("✅ 下一章章节名预载成功，大小: \(data.count) 字节", category: "TTS")
                 }
             } catch {
                 logger.log("下一章章节名预载失败: \(error)", category: "TTS错误")
@@ -1152,17 +1095,16 @@ class TTSManager: NSObject, ObservableObject {
         let ttsId = UserPreferences.shared.selectedTTSId
         
         guard !ttsId.isEmpty else { return }
-        guard let encodedText = sentence.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return }
-        
-        let urlString = "\(UserPreferences.shared.serverURL)/api/\(APIService.apiVersion)/tts?accessToken=\(UserPreferences.shared.accessToken)&id=\(ttsId)&speakText=\(encodedText)&speechRate=\(speechRate)"
-        
-        guard let url = URL(string: urlString) else { return }
         
         logger.log("预载下一章音频 - 索引: \(index)", category: "TTS")
         
         Task {
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let data = try await APIService.shared.fetchTTSAudioData(
+                    ttsId: ttsId,
+                    text: sentence,
+                    speechRate: speechRate
+                )
                 
                 await MainActor.run {
                     guard self.nextChapterPreloadToken == token,
@@ -1170,14 +1112,8 @@ class TTSManager: NSObject, ObservableObject {
                         return
                     }
                     
-                    if let httpResponse = response as? HTTPURLResponse,
-                       httpResponse.statusCode == 200,
-                       let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
-                       contentType.contains("audio"),
-                       data.count >= 10000 {
-                        nextChapterCache[index] = data
-                        logger.log("✅ 下一章预载成功 - 索引: \(index), 大小: \(data.count) 字节", category: "TTS")
-                    }
+                    nextChapterCache[index] = data
+                    logger.log("✅ 下一章预载成功 - 索引: \(index), 大小: \(data.count) 字节", category: "TTS")
                 }
             } catch {
                 logger.log("下一章预载失败 - 索引: \(index), 错误: \(error)", category: "TTS错误")
@@ -1198,7 +1134,9 @@ class TTSManager: NSObject, ObservableObject {
         
         stopKeepAlive()
         audioPlayer?.stop()
+        audioPlayer?.delegate = nil
         audioPlayer = nil
+        currentPlayToken = UUID()  // 作废任何正在进行的下载 Task
         isPlaying = false
         isPaused = false
         currentSentenceIndex = 0
