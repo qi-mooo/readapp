@@ -46,7 +46,11 @@ class TTSManager: NSObject, ObservableObject {
     
     // 章节名朗读
     private var isReadingChapterTitle = false  // 是否正在朗读章节名
-    
+
+    // 淡出 timer
+    private var fadeOutTimer: Timer?
+    private let fadeDuration: TimeInterval = 0.4
+
     // 后台保活
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var keepAlivePlayer: AVAudioPlayer?
@@ -460,6 +464,25 @@ class TTSManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - 淡出调度
+    private func scheduleFadeOut() {
+        cancelFadeOut()
+        guard UserPreferences.shared.ttsFadeEnabled,
+              let player = audioPlayer,
+              player.duration > fadeDuration * 2 else { return }
+
+        let fireDelay = player.duration - fadeDuration
+        fadeOutTimer = Timer.scheduledTimer(withTimeInterval: fireDelay, repeats: false) { [weak self] _ in
+            guard let self, let p = self.audioPlayer, p.isPlaying else { return }
+            p.setVolume(0.0, fadeDuration: self.fadeDuration)
+        }
+    }
+
+    private func cancelFadeOut() {
+        fadeOutTimer?.invalidate()
+        fadeOutTimer = nil
+    }
+
     // MARK: - 开始后台任务
     private func beginBackgroundTask() {
         endBackgroundTask()  // 先结束之前的任务
@@ -857,6 +880,7 @@ class TTSManager: NSObject, ObservableObject {
     private func playAudioWithData(data: Data) {
         do {
             // 先停掉旧 player 并清空 delegate，防止其释放时触发 audioPlayerDidFinishPlaying
+            cancelFadeOut()
             audioPlayer?.stop()
             audioPlayer?.delegate = nil
             audioPlayer = nil
@@ -864,12 +888,14 @@ class TTSManager: NSObject, ObservableObject {
             // 使用 AVAudioPlayer 播放下载的数据
             audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer?.delegate = self
-            audioPlayer?.volume = 1.0
-            
+
+            let fadeEnabled = UserPreferences.shared.ttsFadeEnabled
+            audioPlayer?.volume = fadeEnabled ? 0.0 : 1.0
+
             logger.log("创建 AVAudioPlayer 成功", category: "TTS")
             logger.log("音频时长: \(audioPlayer?.duration ?? 0) 秒", category: "TTS")
             logger.log("音频格式: \(audioPlayer?.format.description ?? "unknown")", category: "TTS")
-            
+
             let success = audioPlayer?.play() ?? false
             if success {
                 logger.log("✅ 音频开始播放", category: "TTS")
@@ -878,6 +904,12 @@ class TTSManager: NSObject, ObservableObject {
                 stopKeepAlive()
                 // 延长后台任务
                 beginBackgroundTask()
+                // 淡入
+                if fadeEnabled {
+                    audioPlayer?.setVolume(1.0, fadeDuration: fadeDuration)
+                }
+                // 启动淡出 timer
+                scheduleFadeOut()
             } else {
                 logger.log("❌ 音频播放失败，跳过当前段落", category: "TTS错误")
                 isLoading = false
@@ -1132,6 +1164,7 @@ class TTSManager: NSObject, ObservableObject {
             )
         }
         
+        cancelFadeOut()
         stopKeepAlive()
         audioPlayer?.stop()
         audioPlayer?.delegate = nil

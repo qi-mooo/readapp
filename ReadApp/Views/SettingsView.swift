@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var apiService: APIService
     @StateObject private var preferences = UserPreferences.shared
+    @StateObject private var tailscaleManager = TailscaleTunnelManager.shared
     @Environment(\.dismiss) var dismiss
     
     @State private var showTTSSelection = false
@@ -26,7 +27,7 @@ struct SettingsView: View {
                     
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("局域网服务器")
+                            Text("服务器")
                             Spacer()
                             Text(preferences.serverURL)
                                 .font(.caption)
@@ -34,16 +35,13 @@ struct SettingsView: View {
                                 .lineLimit(1)
                         }
                         
-                        if !preferences.publicServerURL.isEmpty {
-                            HStack {
-                                Text("公网服务器")
-                                    .font(.caption)
-                                Spacer()
-                                Text(preferences.publicServerURL)
-                                    .font(.caption2)
-                                    .foregroundColor(.green)
-                                    .lineLimit(1)
-                            }
+                        HStack {
+                            Text("Tailscale")
+                                .font(.caption)
+                            Spacer()
+                            Text(tailscaleManager.statusText)
+                                .font(.caption2)
+                                .foregroundColor(tailscaleManager.status == .connected ? .green : .secondary)
                         }
                     }
                     
@@ -118,6 +116,11 @@ struct SettingsView: View {
                     }
                     
                     Text("提前下载接下来的音频段，减少等待时间。设置越大，切换章节越流畅（建议 10-20 段）")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("淡入淡出", isOn: $preferences.ttsFadeEnabled)
+                    Text("播放每段音频时渐入，结束前渐出，使段落切换更自然")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -224,6 +227,7 @@ struct SettingsView: View {
             }
             .task {
                 await loadTTSName()
+                await tailscaleManager.refreshConfiguration()
             }
             .onChange(of: preferences.selectedTTSId) { _ in
                 Task {

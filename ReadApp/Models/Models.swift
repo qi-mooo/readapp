@@ -1,4 +1,5 @@
 import Foundation
+import NetworkExtension
 
 // MARK: - API Response
 struct APIResponse<T: Codable>: Codable {
@@ -97,12 +98,6 @@ class UserPreferences: ObservableObject {
         }
     }
     
-    @Published var publicServerURL: String {
-        didSet {
-            UserDefaults.standard.set(publicServerURL, forKey: "publicServerURL")
-        }
-    }
-    
     @Published var accessToken: String {
         didSet {
             UserDefaults.standard.set(accessToken, forKey: "accessToken")
@@ -162,6 +157,12 @@ class UserPreferences: ObservableObject {
             UserDefaults.standard.set(useReplaceRuleSanitization, forKey: "useReplaceRuleSanitization")
         }
     }
+
+    @Published var ttsFadeEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(ttsFadeEnabled, forKey: "ttsFadeEnabled")
+        }
+    }
     
     // TTS进度记录：bookUrl -> (chapterIndex, sentenceIndex)
     private var ttsProgress: [String: (Int, Int)] {
@@ -202,7 +203,6 @@ class UserPreferences: ObservableObject {
         self.speechRate = savedSpeechRate == 0 ? 10.0 : savedSpeechRate
         
         self.serverURL = UserDefaults.standard.string(forKey: "serverURL") ?? ""
-        self.publicServerURL = UserDefaults.standard.string(forKey: "publicServerURL") ?? ""
         self.accessToken = UserDefaults.standard.string(forKey: "accessToken") ?? ""
         self.username = UserDefaults.standard.string(forKey: "username") ?? ""
         self.isLoggedIn = UserDefaults.standard.bool(forKey: "isLoggedIn")
@@ -217,11 +217,282 @@ class UserPreferences: ObservableObject {
         } else {
             self.useReplaceRuleSanitization = UserDefaults.standard.bool(forKey: "useReplaceRuleSanitization")
         }
+
+        if UserDefaults.standard.object(forKey: "ttsFadeEnabled") == nil {
+            self.ttsFadeEnabled = true
+        } else {
+            self.ttsFadeEnabled = UserDefaults.standard.bool(forKey: "ttsFadeEnabled")
+        }
     }
     
     func logout() {
         accessToken = ""
         username = ""
         isLoggedIn = false
+    }
+}
+
+// MARK: - Tailscale Tunnel Manager
+@MainActor
+class TailscaleTunnelManager: ObservableObject {
+    static let shared = TailscaleTunnelManager()
+    
+    private let keychainAuthKeyKey = "readapp_tailscale_auth_key"
+    private let controlURL = "https://controlplane.tailscale.com"
+    private let nodeHostname = "readapp-ios"
+    private let nodeDirName = "tailscale-node"
+    
+    private var tailscaleHandle: Int32?
+    private var socksProxy: SocksProxy?
+    
+    @Published var status: NEVPNStatus = .invalid
+    @Published var isConfigured = false
+    @Published var lastError: String?
+    
+    private struct SocksProxy: Sendable {
+        let host: String
+        let port: Int
+        let password: String
+    }
+    
+    private struct StartResult: Sendable {
+        let handle: Int32
+        let proxy: SocksProxy
+    }
+    
+    private init() {
+        isConfigured = !getAuthKey().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        status = .disconnected
+    }
+    
+    func refreshConfiguration() async {
+        isConfigured = !getAuthKey().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if tailscaleHandle == nil {
+            status = .disconnected
+        }
+    }
+    
+    func saveAuthKey(_ authKey: String) {
+        let value = authKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            clearAuthKey()
+            return
+        }
+        
+        do {
+            try KeychainStore.set(value, for: keychainAuthKeyKey)
+            isConfigured = true
+            lastError = nil
+        } catch {
+            lastError = "保存 Tailscale key 失败: \(error.localizedDescription)"
+        }
+    }
+    
+    func clearAuthKey() {
+        disconnect()
+        KeychainStore.delete(keychainAuthKeyKey)
+        isConfigured = false
+        lastError = nil
+    }
+    
+    func getAuthKeyMasked() -> String {
+        let key = getAuthKey()
+        guard !key.isEmpty else { return "" }
+        let prefix = key.prefix(6)
+        return "\(prefix)******"
+    }
+    
+    func getAuthKey() -> String {
+        KeychainStore.get(keychainAuthKeyKey) ?? ""
+    }
+    
+    func connect() async {
+        if status == .connected || status == .connecting {
+            return
+        }
+        
+        let authKey = getAuthKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !authKey.isEmpty else {
+            lastError = "请先填写 Tailscale Auth Key"
+            return
+        }
+        
+        status = .connecting
+        lastError = nil
+        
+        let dirPath: String
+        do {
+            dirPath = try Self.prepareNodeDirectoryPath(name: nodeDirName)
+        } catch {
+            status = .disconnected
+            lastError = "准备 Tailscale 数据目录失败: \(error.localizedDescription)"
+            return
+        }
+        let hostname = nodeHostname
+        let controlPlaneURL = controlURL
+        
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try Self.startEmbeddedNode(
+                    authKey: authKey,
+                    statePath: dirPath,
+                    hostname: hostname,
+                    controlURL: controlPlaneURL
+                )
+            }.value
+            
+            tailscaleHandle = result.handle
+            socksProxy = result.proxy
+            isConfigured = true
+            status = .connected
+            lastError = nil
+        } catch {
+            tailscaleHandle = nil
+            socksProxy = nil
+            status = .disconnected
+            lastError = "启动 Tailscale 失败: \(error.localizedDescription)"
+        }
+    }
+    
+    func disconnect() {
+        guard let handle = tailscaleHandle else {
+            status = .disconnected
+            socksProxy = nil
+            return
+        }
+        
+        _ = tailscale_close(handle)
+        tailscaleHandle = nil
+        socksProxy = nil
+        status = .disconnected
+    }
+    
+    var statusText: String {
+        switch status {
+        case .invalid:
+            return "未配置"
+        case .disconnected:
+            return "未连接"
+        case .connecting:
+            return "连接中"
+        case .connected:
+            return "已连接"
+        case .reasserting:
+            return "重连中"
+        case .disconnecting:
+            return "断开中"
+        @unknown default:
+            return "未知状态"
+        }
+    }
+    
+    func proxyConnectionDictionary() -> [String: Any]? {
+        guard status == .connected else { return nil }
+        guard let proxy = socksProxy else { return nil }
+        return [
+            "SOCKSEnable": 1,
+            "SOCKSProxy": proxy.host,
+            "SOCKSPort": proxy.port,
+            "SOCKSUser": "tsnet",
+            "SOCKSPassword": proxy.password
+        ]
+    }
+    
+    func proxyCredentials() -> (host: String, port: Int, password: String)? {
+        guard status == .connected, let proxy = socksProxy else { return nil }
+        return (proxy.host, proxy.port, proxy.password)
+    }
+    
+    var canProxyRequests: Bool {
+        status == .connected && socksProxy != nil
+    }
+    
+    nonisolated private static func prepareNodeDirectoryPath(name: String) throws -> String {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw NSError(domain: "TailscaleTunnelManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法获取 Application Support 路径"])
+        }
+        
+        let dir = appSupport.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
+    }
+    
+    nonisolated private static func startEmbeddedNode(authKey: String, statePath: String, hostname: String, controlURL: String) throws -> StartResult {
+        let handle = tailscale_new()
+        guard handle > 0 else {
+            throw NSError(domain: "TailscaleTunnelManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "初始化内置 Tailscale 失败"])
+        }
+        
+        func run(_ step: String, _ body: () -> Int32) throws {
+            let code = body()
+            guard code == 0 else {
+                throw NSError(
+                    domain: "TailscaleTunnelManager",
+                    code: Int(code),
+                    userInfo: [NSLocalizedDescriptionKey: "\(step)失败: \(lastErrorMessage(handle: handle, fallbackCode: code))"]
+                )
+            }
+        }
+        
+        do {
+            try run("设置 Auth Key") { authKey.withCString { tailscale_set_authkey(handle, $0) } }
+            try run("设置节点名称") { hostname.withCString { tailscale_set_hostname(handle, $0) } }
+            try run("设置控制平面地址") { controlURL.withCString { tailscale_set_control_url(handle, $0) } }
+            try run("设置节点数据目录") { statePath.withCString { tailscale_set_dir(handle, $0) } }
+            try run("启动内置节点") { tailscale_start(handle) }
+            try run("连接尾网") { tailscale_up(handle) }
+            
+            var addrBuffer = [CChar](repeating: 0, count: 96)
+            var proxyBuffer = [CChar](repeating: 0, count: 33)
+            var localAPIBuffer = [CChar](repeating: 0, count: 33)
+            try run("初始化本地代理") {
+                tailscale_loopback(
+                    handle,
+                    &addrBuffer,
+                    addrBuffer.count,
+                    &proxyBuffer,
+                    &localAPIBuffer
+                )
+            }
+            
+            let address = String(cString: addrBuffer)
+            let proxyPassword = String(cString: proxyBuffer)
+            
+            guard let (host, port) = parseHostPort(address) else {
+                throw NSError(domain: "TailscaleTunnelManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "无效的本地代理地址: \(address)"])
+            }
+            
+            return StartResult(handle: handle, proxy: SocksProxy(host: host, port: port, password: proxyPassword))
+        } catch {
+            _ = tailscale_close(handle)
+            throw error
+        }
+    }
+    
+    nonisolated private static func parseHostPort(_ address: String) -> (String, Int)? {
+        if let components = URLComponents(string: "socks5://\(address)"),
+           let host = components.host,
+           let port = components.port {
+            return (host, port)
+        }
+        
+        if let idx = address.lastIndex(of: ":"),
+           let port = Int(address[address.index(after: idx)...]) {
+            let host = String(address[..<idx])
+            if !host.isEmpty {
+                return (host, port)
+            }
+        }
+        
+        return nil
+    }
+    
+    nonisolated private static func lastErrorMessage(handle: Int32, fallbackCode: Int32) -> String {
+        var buffer = [CChar](repeating: 0, count: 256)
+        let result = tailscale_errmsg(handle, &buffer, buffer.count)
+        if result == 0 {
+            return String(cString: buffer)
+        }
+        return "错误码: \(fallbackCode)"
     }
 }
